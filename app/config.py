@@ -41,7 +41,7 @@ class Settings(BaseSettings):
 
     # ── LLM Provider ─────────────────────────────────────────────────────────
         # Choose one: "openai" | "anthropic" | "google"
-    api_provider: Literal["openai", "anthropic", "google"] = "openai"
+    api_provider: Literal["openai", "anthropic", "google"] = "google"
 
     # ── Telegram ──────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""

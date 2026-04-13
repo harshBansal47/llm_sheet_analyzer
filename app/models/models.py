@@ -7,8 +7,8 @@ structure, NO AI is involved in producing the final answer.
 """
 from __future__ import annotations
 from enum import Enum
-from typing import Any, Literal
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Any, List, Literal, Optional
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,54 +59,93 @@ class FilterCondition(BaseModel):
 
 class StructuredQuery(BaseModel):
     """
-    The machine-readable representation of a user's natural language question.
-    This is produced by the NLP layer and consumed exclusively by the
-    deterministic query engine.  No AI touches the data after this point.
+    Robust machine-readable query representation.
+    Handles imperfect LLM outputs safely.
     """
+
     intent: str = Field(
-        description="Short human-readable intent label, e.g. 'payment_percent_for_customer'"
+        default="unknown",
+        description="Short human-readable intent label"
     )
-    # Which tab/sheet to query.  The parser picks this from the live schema.
-    # None means "search across all tabs" (used when the tab is ambiguous).
-    sheet_tab: str | None = Field(
+
+    sheet_tab: Optional[str] = Field(
         default=None,
-        description="Exact worksheet tab name to query, as it appears in the spreadsheet"
+        description="Exact worksheet tab name"
     )
-    filters: list[FilterCondition] = Field(
+
+    filters: List[FilterCondition] = Field(
         default_factory=list,
-        description="All WHERE-style conditions to apply before aggregation"
+        description="WHERE-style conditions"
     )
+
     aggregation: AggregationType = Field(
-        default=AggregationType.LIST,
-        description="What to compute on the filtered rows"
+        default=AggregationType.LIST
     )
-    # Fields to show in list/table output
-    display_fields: list[str] = Field(
-        default_factory=list,
-        description="Column names to include in the response (use exact sheet column names)"
+
+    display_fields: List[str] = Field(
+        default_factory=list
     )
-    # For SUM / AVERAGE / PERCENTAGE aggregations
-    target_field: str | None = Field(
-        default=None,
-        description="The numeric column to aggregate (exact sheet column name)"
-    )
-    # For PERCENTAGE: numerator field and denominator field
-    numerator_field: str | None = None
-    denominator_field: str | None = None
+
+    target_field: Optional[str] = None
+    numerator_field: Optional[str] = None
+    denominator_field: Optional[str] = None
 
     output_format: OutputFormat = OutputFormat.LIST
 
-    # Raw user question – stored for logging / audit
     raw_question: str = ""
+
     confidence: float = Field(
         default=1.0,
-        ge=0.0, le=1.0,
-        description="Parser confidence (0-1). Queries below 0.7 trigger clarification."
+        ge=0.0,
+        le=1.0
     )
+
     clarification_needed: bool = False
+
     clarification_message: str = ""
 
-    model_config = ConfigDict(use_enum_values=True)
+    model_config = ConfigDict(
+        use_enum_values=True,
+        extra="ignore",  # Ignore unexpected LLM fields
+        str_strip_whitespace=True  # Auto-trim strings
+    )
+
+    # 🔥 VALIDATORS (IMPORTANT)
+
+    @field_validator("clarification_message", mode="before")
+    @classmethod
+    def fix_clarification_message(cls, v):
+        return v or ""
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def fix_intent(cls, v):
+        return v or "unknown"
+
+    @field_validator("sheet_tab", mode="before")
+    @classmethod
+    def clean_sheet_tab(cls, v):
+        if not v:
+            return None
+        return v.strip()
+
+    @field_validator("display_fields", mode="before")
+    @classmethod
+    def ensure_list(cls, v):
+        return v or []
+
+    @field_validator("filters", mode="before")
+    @classmethod
+    def ensure_filters(cls, v):
+        return v or []
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def safe_confidence(cls, v):
+        try:
+            return float(v)
+        except:
+            return 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

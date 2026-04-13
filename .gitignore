@@ -69,7 +69,8 @@ htmlcov/
 .coverage.*
 .cache
 pytest_cache/
-app/cache/
+app/cache/*
+cache/*
 
 # Type checkers
 

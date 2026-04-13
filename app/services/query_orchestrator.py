@@ -16,6 +16,7 @@ from app.services.query_engine import get_query_engine
 from app.services.sheets_service import get_sheets_service
 from app.services.response_formatter import get_formatter
 from app.utils.logger import get_logger
+from app.config import get_settings
 
 logger = get_logger(__name__)
 
@@ -86,7 +87,6 @@ class QueryOrchestrator:
         elapsed = round((time.monotonic() - t0) * 1000, 1)
         logger.info("query_complete", ms=elapsed, success=result.success)
 
-        from config import get_settings
         if get_settings().is_dev:
             response += f"\n\n`[{elapsed}ms total | engine: {result.execution_time_ms}ms]`"
 

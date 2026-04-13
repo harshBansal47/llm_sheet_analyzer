@@ -17,12 +17,12 @@ from __future__ import annotations
 import json
 import time
 
-from models import (
+from app.models.models import (
     StructuredQuery, FilterCondition, FilterOperator,
     AggregationType, OutputFormat,
 )
-from services.llm_client import get_llm_client
-from utils.logger import get_logger
+from app.services.llm_client import get_llm_client
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
