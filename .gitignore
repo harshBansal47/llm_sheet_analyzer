@@ -43,6 +43,11 @@ venv.bak/
 .env.*
 !.env.example
 
+app/credentials.json
+app/metadata.json
+app/*.parquet
+
+
 # FastAPI / Uvicorn
 
 *.log

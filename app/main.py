@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
- 
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
  
@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
         svc = get_sheets_service()
         # Keep startup responsive if Google API is slow/unreachable.
         await asyncio.wait_for(
-            asyncio.to_thread(svc.get_dataframe, force_refresh=True),
+            asyncio.to_thread(svc.sync_dataframe, force_refresh=True),
             timeout=20,
         )
         logger.info("sheet_cache_warmed")

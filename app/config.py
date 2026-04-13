@@ -9,7 +9,9 @@ picked up on the next cache refresh.
 """
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path
 
+base_dir = Path(__file__).resolve().parent
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -20,8 +22,8 @@ class Settings(BaseSettings):
     )
 
     # ── Google Sheets ─────────────────────────────────────────────────────────
-    google_service_account_file: str = "credentials/service_account.json"
-    google_sheet_id: str
+    google_service_account_file: Path = base_dir / "credentials.json"
+    google_sheet_id: str 
 
     # ── OpenAI (NL parsing ONLY) ──────────────────────────────────────────────
     openai_api_key: str
@@ -42,13 +44,14 @@ class Settings(BaseSettings):
     secret_key: str = "change_me"
     log_level: str = "INFO"
     sheet_cache_ttl: int = 30           # seconds between sheet refreshes
+    cache_dir:Path = base_dir
     allowed_telegram_user_ids: str = "" # comma-separated IDs, empty = all
 
     # ── Numeric detection threshold ───────────────────────────────────────────
     # A column is auto-detected as numeric if this fraction of its non-empty
     # values parse successfully as numbers.  Default 0.6 = 60%.
     numeric_detection_threshold: float = 0.6
-
+    
     @property
     def allowed_user_ids(self) -> list[int]:
         if not self.allowed_telegram_user_ids.strip():

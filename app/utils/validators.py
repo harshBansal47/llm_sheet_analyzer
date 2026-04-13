@@ -9,7 +9,7 @@ v2 changes:
     a hardcoded list of canonical field names.
   • Numeric-operator check uses the inferred type from the schema.
 """
-from models import StructuredQuery, FilterCondition
+from app.models.models import StructuredQuery, FilterCondition
 
 NUMERIC_OPERATORS = {"gt", "gte", "lt", "lte"}
 

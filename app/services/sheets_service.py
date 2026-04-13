@@ -1,26 +1,13 @@
-"""
-services/sheets_service.py  –  Multi-tab Google Sheets integration.
-
-Key changes from v1:
-  • Loads ALL worksheet tabs, not just one named tab.
-  • Returns a dict[tab_name → DataFrame] — one entry per sheet.
-  • Auto-detects numeric columns via heuristic (no static column map).
-  • Exposes get_schema() → dict[tab_name → {col_name: "numeric"|"text"}]
-    which the query parser injects into its dynamic system prompt.
-  • Tab list and column headers update automatically on next cache refresh —
-    no code changes needed when the spreadsheet structure changes.
-
-Cache keys:
-  "all_tabs"  → dict[str, pd.DataFrame]
-  "schema"    → dict[str, dict[str, str]]  (derived, invalidated with data)
-"""
 from __future__ import annotations
 import time
 import datetime
+import threading
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from app.utils.cache import get_sheet_cache
+from googleapiclient.discovery import build as google_build
+
+from app.utils.cache import get_parquet_cache, ParquetCache
 from app.utils.logger import get_logger
 from app.config import get_settings
 
@@ -28,109 +15,180 @@ logger = get_logger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
-
-CACHE_KEY_DATA   = "all_tabs"
-CACHE_KEY_SCHEMA = "schema"
 
 NUMERIC = "numeric"
 TEXT    = "text"
 
 
 class SheetsService:
+
     def __init__(self):
-        self._settings = get_settings()
-        self._cache    = get_sheet_cache(ttl=self._settings.sheet_cache_ttl)
-        self._client: gspread.Client | None = None
+        self._settings     = get_settings()
+        self._cache        = get_parquet_cache(self._settings.cache_dir)
+        self._gspread:     gspread.Client | None = None
+        self._drive        = None          # Drive API client
+        self._fetch_lock   = threading.Lock()  # prevent concurrent Sheets fetches
+
+        # Boot: load Parquet cache into memory so first query is fast
+        self._cache.load_from_disk()
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Public API
+    # Public API  (called by query engine + orchestrator)
     # ──────────────────────────────────────────────────────────────────────────
 
     def get_all_dataframes(self, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
         """
         Return all tabs as { tab_name: DataFrame }.
-        Each call returns fresh copies so callers cannot mutate the cache.
-        """
-        if not force_refresh:
-            cached = self._cache.get(CACHE_KEY_DATA)
-            if cached is not None:
-                logger.debug("sheet_cache_hit")
-                return {k: v.copy() for k, v in cached.items()}
 
-        logger.info("sheet_cache_miss_fetching_all_tabs")
-        all_dfs = self._fetch_all_tabs()
-        self._cache.set(CACHE_KEY_DATA, all_dfs)
-        self._cache.invalidate(CACHE_KEY_SCHEMA)   # rebuild on next call
+        On every call:
+          1. Ask Drive API for current modifiedTime of the spreadsheet.
+          2. Compare with the modifiedTime we recorded at our last fetch.
+          3. If unchanged → serve from memory (or reload parquet if memory cold).
+          4. If changed (or force_refresh) → fetch from Sheets API + save parquet.
+
+        Returns fresh copies so callers cannot corrupt the cache.
+        """
+        t0 = time.monotonic()
+
+        # ── 1. Get current modifiedTime from Drive API ────────────────────────
+        try:
+            current_modified = self._get_sheet_modified_time()
+        except Exception as exc:
+            logger.warning(
+                "drive_check_failed_serving_from_cache",
+                error=str(exc),
+            )
+            # Drive API failed → fall back to whatever we have
+            return self._serve_from_cache_or_raise()
+
+        # ── 2. Compare with stored modifiedTime ───────────────────────────────
+        stored_modified = self._cache.get_stored_modified_time()
+
+        if not force_refresh and current_modified == stored_modified:
+            # Sheet has not changed
+            drive_ms = round((time.monotonic() - t0) * 1000, 1)
+            if self._cache.has_memory_data():
+                logger.debug(
+                    "cache_valid_serving_memory",
+                    modified=current_modified,
+                    drive_check_ms=drive_ms,
+                )
+                return self._cache.get_dataframes()
+            else:
+                # Memory was cleared (e.g. after restart) but Parquet is valid
+                logger.info(
+                    "memory_cold_reloading_parquet",
+                    modified=current_modified,
+                    drive_check_ms=drive_ms,
+                )
+                if self._cache.load_from_disk():
+                    return self._cache.get_dataframes()
+                # Parquet gone too → fall through to full fetch
+
+        # ── 3. Sheet has changed (or no cache exists) → fetch from Sheets API ─
+        change_reason = (
+            "force_refresh" if force_refresh
+            else "first_load" if stored_modified is None
+            else f"sheet_modified  {stored_modified} → {current_modified}"
+        )
+        logger.info("sheet_data_stale_fetching", reason=change_reason)
+
+        # Prevent multiple concurrent fetches (e.g. burst of simultaneous queries)
+        with self._fetch_lock:
+            # Re-check after acquiring lock — another thread may have just fetched
+            if not force_refresh:
+                latest_stored = self._cache.get_stored_modified_time()
+                if latest_stored == current_modified and self._cache.has_memory_data():
+                    logger.debug("cache_populated_by_concurrent_fetch")
+                    return self._cache.get_dataframes()
+
+            all_dfs = self._fetch_all_tabs()
+            schema  = {tab: self._infer_column_types(df) for tab, df in all_dfs.items()}
+            self._cache.set_dataframes(all_dfs, schema)
+            self._cache.save_metadata(current_modified)
+
+        total_ms = round((time.monotonic() - t0) * 1000, 1)
+        logger.info(
+            "sheets_fetch_complete",
+            tabs=list(all_dfs.keys()),
+            total_ms=total_ms,
+        )
         return {k: v.copy() for k, v in all_dfs.items()}
 
-    def get_dataframe(self, tab_name: str, force_refresh: bool = False) -> pd.DataFrame:
-        """Convenience: return a single tab's DataFrame. Raises KeyError if not found."""
+    def sync_dataframe(self,force_refresh: bool = False) -> pd.DataFrame:
         all_dfs = self.get_all_dataframes(force_refresh=force_refresh)
-        if tab_name not in all_dfs:
-            available = ", ".join(f'"{t}"' for t in all_dfs.keys())
-            raise KeyError(f"Tab '{tab_name}' not found. Available: {available}")
-        return all_dfs[tab_name]
+        
 
     def get_schema(self, force_refresh: bool = False) -> dict[str, dict[str, str]]:
         """
-        Return the live schema:
-          { tab_name: { column_name: "numeric" | "text" } }
-
-        Injected into the NLP parser's system prompt at parse time so the LLM
-        always knows the current sheet structure with zero hardcoding.
+        Return { tab_name: { col_name: "numeric"|"text" } }.
+        Triggers the same Drive-check / cache logic as get_all_dataframes.
         """
-        if not force_refresh:
-            cached = self._cache.get(CACHE_KEY_SCHEMA)
-            if cached is not None:
-                return cached
-
-        all_dfs = self.get_all_dataframes(force_refresh=force_refresh)
-        schema: dict[str, dict[str, str]] = {
-            tab: self._infer_column_types(df)
-            for tab, df in all_dfs.items()
-        }
-        self._cache.set(CACHE_KEY_SCHEMA, schema)
-        logger.info(
-            "schema_built",
-            tabs=list(schema.keys()),
-            total_cols=sum(len(v) for v in schema.values()),
-        )
-        return schema
+        self.get_all_dataframes(force_refresh=force_refresh)   # ensure cache is current
+        return self._cache.get_schema()
 
     def get_tab_names(self) -> list[str]:
         return list(self.get_all_dataframes().keys())
 
     def last_refreshed_str(self) -> str:
-        ts = self._cache.last_refreshed(CACHE_KEY_DATA)
-        if ts is None:
+        cached_at = self._cache.get_cached_at()
+        if cached_at == "never":
             return "never"
-        return datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        # cached_at is already an ISO string — just trim the seconds for display
+        return cached_at[:19].replace("T", " ") + " UTC"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Internal – fetching
+    # Drive API  –  modifiedTime check
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _get_client(self) -> gspread.Client:
-        if self._client is None:
+    def _get_drive_client(self):
+        if self._drive is None:
             creds = Credentials.from_service_account_file(
                 self._settings.google_service_account_file,
                 scopes=SCOPES,
             )
-            self._client = gspread.authorize(creds)
-            logger.info("google_sheets_client_initialized")
-        return self._client
+            self._drive = google_build("drive", "v3", credentials=creds, cache_discovery=False)
+            logger.info("drive_client_initialized")
+        return self._drive
+
+    def _get_sheet_modified_time(self) -> str:
+        """
+        Call Drive API files.get to retrieve the spreadsheet's modifiedTime.
+        Returns an ISO 8601 string, e.g. "2024-11-15T08:23:10.000Z".
+        This is a metadata-only request — no cell data is transferred.
+        """
+        drive   = self._get_drive_client()
+        result  = (
+            drive.files()
+            .get(fileId=self._settings.google_sheet_id, fields="modifiedTime")
+            .execute()
+        )
+        return result["modifiedTime"]
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Sheets API  –  full data fetch
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _get_gspread_client(self) -> gspread.Client:
+        if self._gspread is None:
+            creds = Credentials.from_service_account_file(
+                self._settings.google_service_account_file,
+                scopes=SCOPES,
+            )
+            self._gspread = gspread.authorize(creds)
+            logger.info("gspread_client_initialized")
+        return self._gspread
 
     def _fetch_all_tabs(self) -> dict[str, pd.DataFrame]:
-        """Fetch every worksheet. Skips empty or broken sheets gracefully."""
         t0     = time.monotonic()
-        client = self._get_client()
+        client = self._get_gspread_client()
         sheet  = client.open_by_key(self._settings.google_sheet_id)
-        all_dfs: dict[str, pd.DataFrame] = {}
+        result: dict[str, pd.DataFrame] = {}
 
         for worksheet in sheet.worksheets():
-            tab_name = worksheet.title
+            tab = worksheet.title
             try:
                 records = worksheet.get_all_records(
                     expected_headers=[],
@@ -138,43 +196,40 @@ class SheetsService:
                     numericise_ignore=["all"],
                 )
                 if not records:
-                    logger.warning("tab_empty_skipped", tab=tab_name)
+                    logger.warning("tab_empty_skipped", tab=tab)
                     continue
 
                 df = pd.DataFrame(records)
-                # Drop entirely-empty columns and rows (Google Sheets padding)
+                # Drop padding columns/rows Google Sheets sometimes adds
                 df = df.loc[:, df.astype(str).ne("").any(axis=0)]
                 df = df[df.astype(str).ne("").any(axis=1)].reset_index(drop=True)
 
                 if df.empty:
-                    logger.warning("tab_empty_after_clean", tab=tab_name)
+                    logger.warning("tab_empty_after_clean", tab=tab)
                     continue
 
                 df = self._coerce_types(df)
-                all_dfs[tab_name] = df
-                logger.info("tab_loaded", tab=tab_name, rows=len(df), cols=list(df.columns))
+                result[tab] = df
+                logger.info("tab_fetched", tab=tab, rows=len(df), cols=list(df.columns))
 
             except Exception as exc:
-                logger.error("tab_fetch_error", tab=tab_name, error=str(exc))
-                continue   # skip broken tab; don't abort entire fetch
+                logger.error("tab_fetch_error", tab=tab, error=str(exc))
 
         elapsed = round((time.monotonic() - t0) * 1000, 1)
-        logger.info("all_tabs_fetched", count=len(all_dfs), tabs=list(all_dfs.keys()), ms=elapsed)
-        return all_dfs
+        logger.info(
+            "all_tabs_fetched_from_sheets_api",
+            tabs=list(result.keys()),
+            ms=elapsed,
+        )
+        return result
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Internal – type inference
+    # Type inference
     # ──────────────────────────────────────────────────────────────────────────
 
     def _coerce_types(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Auto-detect and coerce column types.
-        A column is numeric if >= numeric_detection_threshold of its non-empty
-        cells parse successfully as a number after stripping currency/% symbols.
-        """
         threshold = self._settings.numeric_detection_threshold
         df = df.copy()
-
         for col in df.columns:
             cleaned = (
                 df[col].astype(str).str.strip()
@@ -188,10 +243,8 @@ class SheetsService:
             if non_empty.empty:
                 df[col] = cleaned
                 continue
-
-            parsed      = pd.to_numeric(non_empty, errors="coerce")
+            parsed       = pd.to_numeric(non_empty, errors="coerce")
             success_rate = parsed.notna().sum() / len(non_empty)
-
             if success_rate >= threshold:
                 df[col] = pd.to_numeric(
                     cleaned.replace({"": float("nan"), "nan": float("nan")}),
@@ -199,7 +252,6 @@ class SheetsService:
                 )
             else:
                 df[col] = cleaned
-
         return df
 
     def _infer_column_types(self, df: pd.DataFrame) -> dict[str, str]:
@@ -207,6 +259,21 @@ class SheetsService:
             col: NUMERIC if pd.api.types.is_numeric_dtype(df[col]) else TEXT
             for col in df.columns
         }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal helper
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _serve_from_cache_or_raise(self) -> dict[str, pd.DataFrame]:
+        """Called when Drive API is unreachable. Serve stale data with a warning."""
+        if self._cache.has_memory_data():
+            return self._cache.get_dataframes()
+        if self._cache.load_from_disk():
+            return self._cache.get_dataframes()
+        raise RuntimeError(
+            "Drive API unreachable and no local cache found. "
+            "Please ensure the server can reach Google APIs."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
