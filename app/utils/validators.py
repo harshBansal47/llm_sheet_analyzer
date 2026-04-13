@@ -1,13 +1,16 @@
 """
 utils/validators.py  –  Pre-execution validation of StructuredQuery.
 
-Runs BEFORE the query engine so we catch bad parses early and return
-a helpful clarification instead of a wrong answer.
+Runs BEFORE the query engine so bad parses are caught early and return a
+helpful clarification message instead of a wrong or confusing answer.
+
+v2 changes:
+  • Accepts live tab_schema dict { col_name: "numeric"|"text" } instead of
+    a hardcoded list of canonical field names.
+  • Numeric-operator check uses the inferred type from the schema.
 """
-from app.models.models import StructuredQuery, FilterCondition, AggregationType
+from models import StructuredQuery, FilterCondition
 
-
-NUMERIC_FIELDS = {"payment_percent", "total_cost", "amount_received"}
 NUMERIC_OPERATORS = {"gt", "gte", "lt", "lte"}
 
 
@@ -17,59 +20,79 @@ class ValidationError(Exception):
         super().__init__(message)
 
 
-def validate_query(query: StructuredQuery, available_columns: list[str]) -> None:
+def validate_query(
+    query: StructuredQuery,
+    available_columns: list[str],
+    tab_schema: dict[str, str] | None = None,
+) -> None:
     """
     Raises ValidationError with a user-friendly message if the query is
     structurally invalid or references non-existent fields.
+
+    tab_schema: { col_name: "numeric" | "text" }  (optional but recommended)
     """
+    tab_schema = tab_schema or {}
+
     # 1. Confidence gate
     if query.confidence < 0.60:
         raise ValidationError(
             "I'm not confident I understood your question correctly. "
-            "Could you rephrase it? "
-            f"(Hint: {query.clarification_message})"
+            "Could you rephrase it?"
+            + (f"\n(Hint: {query.clarification_message})" if query.clarification_message else "")
         )
 
-    # 2. Clarification required by parser
+    # 2. Parser explicitly requested clarification
     if query.clarification_needed:
-        raise ValidationError(query.clarification_message)
+        raise ValidationError(query.clarification_message or "Please clarify your question.")
 
-    # 3. Validate filter fields exist
+    # 3. Filter fields must exist in the tab
     for f in query.filters:
         if f.field not in available_columns:
             close = _suggest_close(f.field, available_columns)
             raise ValidationError(
-                f"Column '{f.field}' not found in the sheet. "
-                + (f"Did you mean '{close}'?" if close else "")
+                f"Column \"{f.field}\" not found in this sheet."
+                + (f" Did you mean \"{close}\"?" if close else "")
             )
 
-    # 4. Validate numeric operators are on numeric fields
-    for f in query.filters:
-        if f.operator in NUMERIC_OPERATORS and f.field not in NUMERIC_FIELDS:
-            raise ValidationError(
-                f"Cannot apply numeric comparison on non-numeric field '{f.field}'."
-            )
+    # 4. Numeric operators must be used on numeric columns (when schema known)
+    if tab_schema:
+        for f in query.filters:
+            op = f.operator if isinstance(f.operator, str) else f.operator.value
+            if op in NUMERIC_OPERATORS:
+                col_type = tab_schema.get(f.field, "text")
+                if col_type != "numeric":
+                    raise ValidationError(
+                        f"Cannot apply numeric comparison ('{op}') on "
+                        f"non-numeric column \"{f.field}\"."
+                    )
 
-    # 5. Aggregation-specific checks
-    agg = query.aggregation
+    # 5. Aggregation field checks
+    agg = query.aggregation if isinstance(query.aggregation, str) else query.aggregation.value
+
     if agg in ("sum", "average", "min", "max") and not query.target_field:
         raise ValidationError(
-            f"Aggregation '{agg}' requires specifying which field to compute."
+            f"Aggregation '{agg}' requires a target column. "
+            "Please specify which column to compute."
         )
+
     if agg == "percentage":
         if not query.numerator_field or not query.denominator_field:
             raise ValidationError(
-                "Percentage calculation needs both a numerator and denominator field."
+                "Percentage calculation needs both a numerator column and a denominator column."
             )
-
-    # 6. Empty filter warning (returns all rows – warn but allow)
-    # This is intentional for queries like "list all customers"
+        # Both must be numeric
+        if tab_schema:
+            for field_name in (query.numerator_field, query.denominator_field):
+                if field_name and tab_schema.get(field_name) != "numeric":
+                    raise ValidationError(
+                        f"Percentage calculation: column \"{field_name}\" must be numeric."
+                    )
 
 
 def _suggest_close(field: str, available: list[str]) -> str | None:
-    """Very simple Levenshtein-like suggestion."""
-    field_lower = field.lower()
+    """Simple substring-based suggestion."""
+    fl = field.lower()
     for col in available:
-        if field_lower in col.lower() or col.lower() in field_lower:
+        if fl in col.lower() or col.lower() in fl:
             return col
     return None

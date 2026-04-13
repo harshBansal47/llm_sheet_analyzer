@@ -95,25 +95,40 @@ class ResponseFormatter:
 
     def _format_row(self, idx: int, row: dict, md: bool) -> str:
         b = "**" if md else ""
+        # Show source tab provenance if present (multi-tab search result)
+        tab_line = ""
+        if "_source_tab" in row:
+            tab_line = f"  _{row['_source_tab']}_\n" if md else f"  [{row['_source_tab']}]\n"
+
         lines = [f"{b}#{idx}{b}"]
+        if tab_line:
+            lines.append(tab_line.rstrip())
+
         for key, val in row.items():
+            if key == "_source_tab":
+                continue
             if val in ("", "nan", "None", None):
                 continue
-            label = key.replace("_", " ").title()
-            # Format numeric fields nicely
-            if key == "payment_percent":
-                try:
-                    lines.append(f"  • {label}: {float(val):.1f}%")
-                except (ValueError, TypeError):
-                    lines.append(f"  • {label}: {val}")
-            elif key in ("total_cost", "amount_received"):
-                try:
-                    lines.append(f"  • {label}: ₹{float(val):,.0f}")
-                except (ValueError, TypeError):
-                    lines.append(f"  • {label}: {val}")
-            else:
+            label = key  # use real column name directly — no canonical remapping
+            # Smart formatting for obviously numeric-looking columns
+            try:
+                fval = float(val)
+                col_lower = key.lower()
+                if "percent" in col_lower or "%" in col_lower:
+                    lines.append(f"  • {label}: {fval:.1f}%")
+                elif any(w in col_lower for w in ("cost", "amount", "price", "value", "paid", "received")):
+                    lines.append(f"  • {label}: ₹{fval:,.0f}")
+                else:
+                    lines.append(f"  • {label}: {self._fmt_numeric(fval)}")
+            except (ValueError, TypeError):
                 lines.append(f"  • {label}: {val}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_numeric(val: float) -> str:
+        if val == int(val):
+            return f"{int(val):,}"
+        return f"{val:,.2f}"
 
 
 # Singleton

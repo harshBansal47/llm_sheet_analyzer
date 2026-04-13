@@ -74,7 +74,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-
 app.include_router(bot.router)
 app.include_router(query.router)

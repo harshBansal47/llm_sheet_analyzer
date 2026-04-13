@@ -1,15 +1,18 @@
 """
-services/sheets_service.py  –  Google Sheets integration.
+services/sheets_service.py  –  Multi-tab Google Sheets integration.
 
-Responsibilities:
-  • Authenticate via Service Account
-  • Fetch the worksheet as a pandas DataFrame
-  • Cache with TTL so repeated queries within `SHEET_CACHE_TTL` seconds
-    don't hit the Sheets API (stays fast + within quota)
-  • Expose canonical column names mapped from config
+Key changes from v1:
+  • Loads ALL worksheet tabs, not just one named tab.
+  • Returns a dict[tab_name → DataFrame] — one entry per sheet.
+  • Auto-detects numeric columns via heuristic (no static column map).
+  • Exposes get_schema() → dict[tab_name → {col_name: "numeric"|"text"}]
+    which the query parser injects into its dynamic system prompt.
+  • Tab list and column headers update automatically on next cache refresh —
+    no code changes needed when the spreadsheet structure changes.
 
-The DataFrame returned is ALWAYS a fresh copy so callers can't
-mutate the cache.
+Cache keys:
+  "all_tabs"  → dict[str, pd.DataFrame]
+  "schema"    → dict[str, dict[str, str]]  (derived, invalidated with data)
 """
 from __future__ import annotations
 import time
@@ -28,54 +31,85 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-CACHE_KEY = "sheet_dataframe"
+CACHE_KEY_DATA   = "all_tabs"
+CACHE_KEY_SCHEMA = "schema"
+
+NUMERIC = "numeric"
+TEXT    = "text"
 
 
 class SheetsService:
     def __init__(self):
         self._settings = get_settings()
-        self._cache = get_sheet_cache(ttl=self._settings.sheet_cache_ttl)
+        self._cache    = get_sheet_cache(ttl=self._settings.sheet_cache_ttl)
         self._client: gspread.Client | None = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Public API
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_dataframe(self, force_refresh: bool = False) -> pd.DataFrame:
+    def get_all_dataframes(self, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
         """
-        Return the sheet data as a pandas DataFrame.
-        Uses cache unless force_refresh=True or TTL expired.
+        Return all tabs as { tab_name: DataFrame }.
+        Each call returns fresh copies so callers cannot mutate the cache.
         """
         if not force_refresh:
-            cached = self._cache.get(CACHE_KEY)
+            cached = self._cache.get(CACHE_KEY_DATA)
             if cached is not None:
                 logger.debug("sheet_cache_hit")
-                return cached.copy()
+                return {k: v.copy() for k, v in cached.items()}
 
-        logger.info("sheet_cache_miss_fetching_from_api")
-        df = self._fetch_from_api()
-        self._cache.set(CACHE_KEY, df)
-        return df.copy()
+        logger.info("sheet_cache_miss_fetching_all_tabs")
+        all_dfs = self._fetch_all_tabs()
+        self._cache.set(CACHE_KEY_DATA, all_dfs)
+        self._cache.invalidate(CACHE_KEY_SCHEMA)   # rebuild on next call
+        return {k: v.copy() for k, v in all_dfs.items()}
 
-    def get_canonical_columns(self) -> dict[str, str]:
-        """Return {canonical_name: actual_sheet_column} from config."""
-        return self._settings.column_map
+    def get_dataframe(self, tab_name: str, force_refresh: bool = False) -> pd.DataFrame:
+        """Convenience: return a single tab's DataFrame. Raises KeyError if not found."""
+        all_dfs = self.get_all_dataframes(force_refresh=force_refresh)
+        if tab_name not in all_dfs:
+            available = ", ".join(f'"{t}"' for t in all_dfs.keys())
+            raise KeyError(f"Tab '{tab_name}' not found. Available: {available}")
+        return all_dfs[tab_name]
+
+    def get_schema(self, force_refresh: bool = False) -> dict[str, dict[str, str]]:
+        """
+        Return the live schema:
+          { tab_name: { column_name: "numeric" | "text" } }
+
+        Injected into the NLP parser's system prompt at parse time so the LLM
+        always knows the current sheet structure with zero hardcoding.
+        """
+        if not force_refresh:
+            cached = self._cache.get(CACHE_KEY_SCHEMA)
+            if cached is not None:
+                return cached
+
+        all_dfs = self.get_all_dataframes(force_refresh=force_refresh)
+        schema: dict[str, dict[str, str]] = {
+            tab: self._infer_column_types(df)
+            for tab, df in all_dfs.items()
+        }
+        self._cache.set(CACHE_KEY_SCHEMA, schema)
+        logger.info(
+            "schema_built",
+            tabs=list(schema.keys()),
+            total_cols=sum(len(v) for v in schema.values()),
+        )
+        return schema
+
+    def get_tab_names(self) -> list[str]:
+        return list(self.get_all_dataframes().keys())
 
     def last_refreshed_str(self) -> str:
-        ts = self._cache.last_refreshed(CACHE_KEY)
+        ts = self._cache.last_refreshed(CACHE_KEY_DATA)
         if ts is None:
             return "never"
-        dt = datetime.datetime.fromtimestamp(ts)
-        return dt.strftime("%H:%M:%S")
-
-    def get_available_canonical_fields(self) -> list[str]:
-        """Returns list of canonical field names present in the sheet."""
-        col_map = self.get_canonical_columns()
-        df = self.get_dataframe()
-        return [canon for canon, actual in col_map.items() if actual in df.columns]
+        return datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Internal
+    # Internal – fetching
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_client(self) -> gspread.Client:
@@ -88,43 +122,94 @@ class SheetsService:
             logger.info("google_sheets_client_initialized")
         return self._client
 
-    def _fetch_from_api(self) -> pd.DataFrame:
-        t0 = time.monotonic()
+    def _fetch_all_tabs(self) -> dict[str, pd.DataFrame]:
+        """Fetch every worksheet. Skips empty or broken sheets gracefully."""
+        t0     = time.monotonic()
         client = self._get_client()
-        sheet = client.open_by_key(self._settings.google_sheet_id)
-        worksheet = sheet.worksheet(self._settings.google_sheet_tab)
-        records = worksheet.get_all_records(
-            expected_headers=[],   # accept any headers
-            value_render_option="UNFORMATTED_VALUE",
-            numericise_ignore=["all"],  # keep raw strings; we'll coerce ourselves
-        )
-        df = pd.DataFrame(records)
-        df = self._coerce_types(df)
-        elapsed = (time.monotonic() - t0) * 1000
-        logger.info("sheet_fetched", rows=len(df), cols=len(df.columns), ms=round(elapsed, 1))
-        return df
+        sheet  = client.open_by_key(self._settings.google_sheet_id)
+        all_dfs: dict[str, pd.DataFrame] = {}
+
+        for worksheet in sheet.worksheets():
+            tab_name = worksheet.title
+            try:
+                records = worksheet.get_all_records(
+                    expected_headers=[],
+                    value_render_option="UNFORMATTED_VALUE",
+                    numericise_ignore=["all"],
+                )
+                if not records:
+                    logger.warning("tab_empty_skipped", tab=tab_name)
+                    continue
+
+                df = pd.DataFrame(records)
+                # Drop entirely-empty columns and rows (Google Sheets padding)
+                df = df.loc[:, df.astype(str).ne("").any(axis=0)]
+                df = df[df.astype(str).ne("").any(axis=1)].reset_index(drop=True)
+
+                if df.empty:
+                    logger.warning("tab_empty_after_clean", tab=tab_name)
+                    continue
+
+                df = self._coerce_types(df)
+                all_dfs[tab_name] = df
+                logger.info("tab_loaded", tab=tab_name, rows=len(df), cols=list(df.columns))
+
+            except Exception as exc:
+                logger.error("tab_fetch_error", tab=tab_name, error=str(exc))
+                continue   # skip broken tab; don't abort entire fetch
+
+        elapsed = round((time.monotonic() - t0) * 1000, 1)
+        logger.info("all_tabs_fetched", count=len(all_dfs), tabs=list(all_dfs.keys()), ms=elapsed)
+        return all_dfs
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal – type inference
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _coerce_types(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Clean and type-coerce the DataFrame.
-        Numeric columns get NaN for blanks; strings get stripped.
+        Auto-detect and coerce column types.
+        A column is numeric if >= numeric_detection_threshold of its non-empty
+        cells parse successfully as a number after stripping currency/% symbols.
         """
-        cfg = self._settings
-        numeric_cols = [cfg.col_total_cost, cfg.col_amount_received, cfg.col_payment_percent]
+        threshold = self._settings.numeric_detection_threshold
+        df = df.copy()
 
         for col in df.columns:
-            if col in numeric_cols:
+            cleaned = (
+                df[col].astype(str).str.strip()
+                .str.replace(",", "", regex=False)
+                .str.replace("%", "", regex=False)
+                .str.replace("₹", "", regex=False)
+                .str.replace("$", "", regex=False)
+                .str.replace("£", "", regex=False)
+            )
+            non_empty = cleaned[cleaned.str.strip().ne("") & cleaned.str.lower().ne("nan")]
+            if non_empty.empty:
+                df[col] = cleaned
+                continue
+
+            parsed      = pd.to_numeric(non_empty, errors="coerce")
+            success_rate = parsed.notna().sum() / len(non_empty)
+
+            if success_rate >= threshold:
                 df[col] = pd.to_numeric(
-                    df[col].astype(str).str.replace(",", "").str.replace("%", "").str.strip(),
+                    cleaned.replace({"": float("nan"), "nan": float("nan")}),
                     errors="coerce",
                 )
             else:
-                df[col] = df[col].astype(str).str.strip()
+                df[col] = cleaned
 
         return df
 
+    def _infer_column_types(self, df: pd.DataFrame) -> dict[str, str]:
+        return {
+            col: NUMERIC if pd.api.types.is_numeric_dtype(df[col]) else TEXT
+            for col in df.columns
+        }
 
-# Module-level singleton
+
+# ─────────────────────────────────────────────────────────────────────────────
 _sheets_service: SheetsService | None = None
 
 

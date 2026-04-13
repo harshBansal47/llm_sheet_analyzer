@@ -1,14 +1,22 @@
 """
 services/query_parser.py  –  Natural Language → StructuredQuery
 
-This is the ONLY place AI is used.  The LLM does NOT see any sheet data
-and does NOT produce any answers.  Its sole job is to parse the user's
-question into a structured JSON object (StructuredQuery) which is then
-executed deterministically by the query engine.
+The ONLY place AI is used.  The LLM does NOT see any row data and does NOT
+produce answers.  Its sole job: parse the user's question into a structured
+JSON object (StructuredQuery) which the deterministic engine executes.
 
-Architecture guarantee:
-  Input  →  [OpenAI]  →  StructuredQuery (JSON)  →  [Python/Pandas]  →  Answer
-               ↑ AI here only                              ↑ No AI here
+Key change from v1: the system prompt is built DYNAMICALLY from the live
+schema returned by SheetsService.get_schema().  This means:
+  • Any new tab added to the spreadsheet is immediately available to the parser
+  • Any column rename is picked up on the next cache refresh
+  • Zero hardcoded column or tab names anywhere in this file
+
+Architecture guarantee (unchanged):
+  User question
+    → [OpenAI: only sees question + schema skeleton, never row data]
+    → StructuredQuery (JSON with exact tab + column names from schema)
+    → [Python/Pandas deterministic engine]
+    → Answer from real data
 """
 from __future__ import annotations
 import json
@@ -23,113 +31,148 @@ from app.config import get_settings
 
 logger = get_logger(__name__)
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# System prompt injected into every parser call
+# Prompt builder  –  schema-aware, generated fresh for every parse call
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a query parser for a real-estate payment tracking database.
+def _build_system_prompt(schema: dict[str, dict[str, str]]) -> str:
+    """
+    Build the full parser system prompt by embedding the live schema.
+
+    schema format:  { "Tab Name": { "Column A": "numeric", "Col B": "text" } }
+    """
+
+    # ── 1. Format schema as readable block ───────────────────────────────────
+    schema_lines: list[str] = []
+    for tab_name, columns in schema.items():
+        schema_lines.append(f'\nSheet tab: "{tab_name}"')
+        for col_name, col_type in columns.items():
+            schema_lines.append(f'  - "{col_name}" ({col_type})')
+
+    schema_block = "\n".join(schema_lines)
+    tab_list     = ", ".join(f'"{t}"' for t in schema.keys())
+
+    return f"""You are a query parser for a business data tracking system backed by Google Sheets.
 Your ONLY job is to convert a natural language question into a structured JSON query.
-You do NOT have access to actual data. You do NOT answer questions.
-You ONLY produce a structured representation of what the user is asking for.
+You do NOT have access to actual row data. You do NOT answer questions.
+You ONLY produce a structured JSON representation of what the user is asking for.
 
-Available canonical field names (use EXACTLY these names):
-  - customer_name    : Name of the customer/buyer
-  - unit             : Apartment/unit identifier (e.g. A-302)
-  - phase            : Project phase (e.g. Phase 1, Phase 2)
-  - total_cost       : Total cost of the unit (numeric)
-  - amount_received  : Amount received/paid so far (numeric)
-  - payment_percent  : Percentage of total cost paid (numeric, 0-100)
-  - status           : Payment/legal status (e.g. Active, Court Case, Defaulter)
-  - remarks          : Free-text remarks
+═══════════════════════════════════════════════════════
+LIVE DATABASE SCHEMA  (auto-generated from the spreadsheet)
+═══════════════════════════════════════════════════════
+{schema_block}
 
-Available filter operators:
+Available sheet tabs: {tab_list}
+═══════════════════════════════════════════════════════
+
+FIELD NAME RULES:
+- Use the EXACT column name as it appears above (case-sensitive, spaces included).
+- Use the EXACT tab name as it appears above in the "sheet_tab" field.
+- Never invent column or tab names not listed above.
+
+FILTER OPERATORS available:
   eq, neq, gt, gte, lt, lte, contains, not_contains, in, not_in
 
-Available aggregation types:
-  list, count, sum, average, percentage, min, max
+AGGREGATION TYPES available:
+  list      → return matching rows
+  count     → count of matching rows
+  sum       → total of a numeric column
+  average   → mean of a numeric column
+  percentage → (numerator_field sum / denominator_field sum) × 100
+  min, max  → extreme value of a numeric column
 
-Output format types:
+OUTPUT FORMAT types:
   single_value, list, table, summary
 
-Rules:
-1. Always output valid JSON matching the schema exactly.
-2. Use confidence (0.0-1.0) to indicate how certain you are.
-3. If the question is ambiguous, set clarification_needed=true.
-4. For "what percent has been received for customer X": use aggregation=list, display payment_percent for that customer.
-5. For "customers who paid more than 70%": filter payment_percent > 70, aggregation=list.
-6. For "total cost and received amount for Unit X": filter unit=X, aggregation=list, display total_cost + amount_received.
-7. For "how many customers in phase 1...": aggregation=count.
-8. For "customers with court cases": filter status contains "court" or status eq "Court Case".
-9. Numbers in filters should be numeric (not strings).
-10. Phase values like "Phase 2" should match exactly including the word "Phase".
+JSON OUTPUT SCHEMA (return this and nothing else):
+{{
+  "intent":              string,           // short label e.g. "payment_percent_for_customer"
+  "sheet_tab":           string | null,    // EXACT tab name from schema, or null if ambiguous
+  "filters": [
+    {{"field": string, "operator": string, "value": any}}
+  ],
+  "aggregation":         string,
+  "display_fields":      [string],         // exact column names to show; empty = all columns
+  "target_field":        string | null,    // for sum/average/min/max
+  "numerator_field":     string | null,    // for percentage
+  "denominator_field":   string | null,    // for percentage
+  "output_format":       string,
+  "confidence":          float (0.0–1.0),
+  "clarification_needed": bool,
+  "clarification_message": string
+}}
+
+PARSING RULES:
+1.  Always output valid JSON matching the schema above exactly.
+2.  Use confidence (0.0–1.0) for how certain you are about the parse.
+3.  If the question clearly refers to one tab, set sheet_tab to that tab name.
+    If multiple tabs could apply, set sheet_tab=null (engine will search all).
+4.  Numbers in filter values must be numeric (not strings).
+5.  Text filter values should preserve the natural casing the user provided.
+    For "contains" / "not_contains" operators the engine is case-insensitive.
+6.  For "how many …": use aggregation=count.
+7.  For "total / sum of …": use aggregation=sum, set target_field.
+8.  For "what percent of X is paid": use aggregation=percentage,
+    set numerator_field and denominator_field.
+9.  For "list / show / find …": use aggregation=list.
+10. If the question is ambiguous or references something not in the schema,
+    set clarification_needed=true and explain in clarification_message.
+11. display_fields should contain ONLY columns that answer the question.
+    For list queries, include identifying columns plus the queried columns.
 """
 
-PARSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "intent": {"type": "string"},
-        "filters": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "field":    {"type": "string"},
-                    "operator": {"type": "string"},
-                    "value":    {}
-                },
-                "required": ["field", "operator", "value"]
-            }
-        },
-        "aggregation":       {"type": "string"},
-        "display_fields":    {"type": "array", "items": {"type": "string"}},
-        "target_field":      {"type": ["string", "null"]},
-        "numerator_field":   {"type": ["string", "null"]},
-        "denominator_field": {"type": ["string", "null"]},
-        "output_format":     {"type": "string"},
-        "confidence":        {"type": "number"},
-        "clarification_needed": {"type": "boolean"},
-        "clarification_message": {"type": "string"}
-    },
-    "required": ["intent", "filters", "aggregation", "confidence"]
-}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# QueryParser
+# ─────────────────────────────────────────────────────────────────────────────
 
 class QueryParser:
     def __init__(self):
         self._settings = get_settings()
-        self._client = AsyncOpenAI(api_key=self._settings.openai_api_key)
+        self._client   = AsyncOpenAI(api_key=self._settings.openai_api_key)
 
-    async def parse(self, question: str) -> StructuredQuery:
+    async def parse(self, question: str, schema: dict[str, dict[str, str]]) -> StructuredQuery:
         """
         Convert a natural language question into a StructuredQuery.
+
+        `schema` is passed in by the orchestrator from SheetsService.get_schema()
+        so the parser always reflects the live spreadsheet structure.
+
         Raises ValueError if the LLM returns unparseable output.
         """
         t0 = time.monotonic()
+        system_prompt = _build_system_prompt(schema)
 
         try:
             response = await self._client.chat.completions.create(
                 model=self._settings.openai_model,
-                temperature=0,          # deterministic parsing
-                max_tokens=600,
+                temperature=0,           # deterministic parsing
+                max_tokens=800,          # slightly more for multi-tab schema
                 response_format={"type": "json_object"},
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": f"Parse this query: {question}"}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": f"Parse this query: {question}"},
                 ],
             )
             raw_json = response.choices[0].message.content
-            elapsed = (time.monotonic() - t0) * 1000
-            logger.info("nlp_parsed", ms=round(elapsed, 1), question=question[:80])
+            elapsed  = round((time.monotonic() - t0) * 1000, 1)
+            logger.info("nlp_parsed", ms=elapsed, question=question[:80])
 
         except Exception as exc:
             logger.error("openai_error", error=str(exc))
             raise ValueError(f"Failed to parse query: {exc}") from exc
 
-        return self._build_query(raw_json, question)
+        return self._build_query(raw_json, question, schema)
 
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _build_query(self, raw_json: str, original_question: str) -> StructuredQuery:
+    def _build_query(
+        self,
+        raw_json: str,
+        original_question: str,
+        schema: dict[str, dict[str, str]],
+    ) -> StructuredQuery:
         try:
             data = json.loads(raw_json)
         except json.JSONDecodeError as exc:
@@ -160,13 +203,21 @@ class QueryParser:
         except ValueError:
             fmt = OutputFormat.LIST
 
-        # Default display_fields if empty
-        display_fields = data.get("display_fields", [])
-        if not display_fields:
-            display_fields = self._infer_display_fields(filters, agg)
+        # Validate sheet_tab against known tabs
+        sheet_tab = data.get("sheet_tab")
+        if sheet_tab and sheet_tab not in schema:
+            # LLM hallucinated a tab name — fall back to None (search all)
+            logger.warning("parser_invalid_tab", tab=sheet_tab, known=list(schema.keys()))
+            sheet_tab = None
+
+        # Smart default display_fields when LLM returns empty list
+        display_fields = data.get("display_fields") or []
+        if not display_fields and sheet_tab and sheet_tab in schema:
+            display_fields = self._default_display_fields(schema[sheet_tab], filters, agg)
 
         return StructuredQuery(
             intent=data.get("intent", "unknown"),
+            sheet_tab=sheet_tab,
             filters=filters,
             aggregation=agg,
             display_fields=display_fields,
@@ -180,21 +231,23 @@ class QueryParser:
             clarification_message=data.get("clarification_message", ""),
         )
 
-    def _infer_display_fields(
+    def _default_display_fields(
         self,
+        tab_schema: dict[str, str],
         filters: list[FilterCondition],
-        agg: AggregationType
+        agg: AggregationType,
     ) -> list[str]:
         """
-        Smart default: always show customer_name + unit + relevant fields.
+        When the LLM omits display_fields, infer sensible defaults:
+        - For list/table: all columns in this tab (the engine will show them all)
+        - For aggregations: only the target/queried column
         """
-        base = ["customer_name", "unit"]
-        if agg in (AggregationType.LIST, AggregationType.TABLE):
-            base += ["phase", "total_cost", "amount_received", "payment_percent", "status"]
-        return list(dict.fromkeys(base))   # deduplicate, preserve order
+        if agg in (AggregationType.LIST.value, AggregationType.TABLE.value, "list", "table"):
+            return list(tab_schema.keys())
+        return []
 
 
-# Module-level singleton
+# ─────────────────────────────────────────────────────────────────────────────
 _parser: QueryParser | None = None
 
 

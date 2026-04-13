@@ -1,10 +1,14 @@
 """
 config.py  –  Central configuration loaded from environment / .env file.
-All secrets and tunables live here. No magic strings scattered in code.
+All secrets and tunables live here.
+
+Column mapping has been removed: the system now auto-discovers all tab names
+and column headers directly from Google Sheets at runtime.  No static metadata
+needed — adding a new tab or renaming a column in the sheet is automatically
+picked up on the next cache refresh.
 """
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -18,7 +22,6 @@ class Settings(BaseSettings):
     # ── Google Sheets ─────────────────────────────────────────────────────────
     google_service_account_file: str = "credentials/service_account.json"
     google_sheet_id: str
-    google_sheet_tab: str = "Sheet1"
 
     # ── OpenAI (NL parsing ONLY) ──────────────────────────────────────────────
     openai_api_key: str
@@ -41,29 +44,10 @@ class Settings(BaseSettings):
     sheet_cache_ttl: int = 30           # seconds between sheet refreshes
     allowed_telegram_user_ids: str = "" # comma-separated IDs, empty = all
 
-    # ── Column Mapping ────────────────────────────────────────────────────────
-    col_customer_name: str = "Customer Name"
-    col_unit: str = "Unit"
-    col_phase: str = "Phase"
-    col_total_cost: str = "Total Cost"
-    col_amount_received: str = "Amount Received"
-    col_payment_percent: str = "Payment %"
-    col_status: str = "Status"
-    col_remarks: str = "Remarks"
-
-    @property
-    def column_map(self) -> dict:
-        """Canonical name → actual sheet column header mapping."""
-        return {
-            "customer_name":    self.col_customer_name,
-            "unit":             self.col_unit,
-            "phase":            self.col_phase,
-            "total_cost":       self.col_total_cost,
-            "amount_received":  self.col_amount_received,
-            "payment_percent":  self.col_payment_percent,
-            "status":           self.col_status,
-            "remarks":          self.col_remarks,
-        }
+    # ── Numeric detection threshold ───────────────────────────────────────────
+    # A column is auto-detected as numeric if this fraction of its non-empty
+    # values parse successfully as numbers.  Default 0.6 = 60%.
+    numeric_detection_threshold: float = 0.6
 
     @property
     def allowed_user_ids(self) -> list[int]:

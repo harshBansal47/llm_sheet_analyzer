@@ -1,9 +1,3 @@
-"""
-bots/telegram_bot.py  –  Telegram Bot integration
-
-Uses python-telegram-bot in webhook mode.
-Webhook is registered automatically on startup.
-"""
 from __future__ import annotations
 import asyncio
 from telegram import Update, Bot
