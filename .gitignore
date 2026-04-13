@@ -43,6 +43,7 @@ venv.bak/
 .env.*
 !.env.example
 
+# Metadata or credentials
 app/credentials.json
 app/metadata.json
 app/*.parquet
@@ -68,6 +69,7 @@ htmlcov/
 .coverage.*
 .cache
 pytest_cache/
+app/cache/
 
 # Type checkers
 
