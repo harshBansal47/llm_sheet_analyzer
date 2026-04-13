@@ -4,7 +4,7 @@ utils/validators.py  –  Pre-execution validation of StructuredQuery.
 Runs BEFORE the query engine so we catch bad parses early and return
 a helpful clarification instead of a wrong answer.
 """
-from models import StructuredQuery, FilterCondition, AggregationType
+from app.models.models import StructuredQuery, FilterCondition, AggregationType
 
 
 NUMERIC_FIELDS = {"payment_percent", "total_cost", "amount_received"}

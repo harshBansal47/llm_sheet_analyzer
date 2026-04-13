@@ -7,8 +7,8 @@ suitable for Telegram (Markdown) or WhatsApp (plain text).
 NO data is generated here. Only formatting of existing QueryResult.
 """
 from __future__ import annotations
-from models import QueryResult, AggregationType, OutputFormat
-from utils.logger import get_logger
+from app.models.models import QueryResult, AggregationType, OutputFormat
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 

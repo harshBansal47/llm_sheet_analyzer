@@ -14,12 +14,12 @@ from __future__ import annotations
 import json
 import time
 from openai import AsyncOpenAI
-from models import (
+from app.models.models import (
     StructuredQuery, FilterCondition, FilterOperator,
     AggregationType, OutputFormat
 )
-from utils.logger import get_logger
-from config import get_settings
+from app.utils.logger import get_logger
+from app.config import get_settings
 
 logger = get_logger(__name__)
 

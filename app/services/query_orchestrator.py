@@ -7,11 +7,11 @@ This is what the bot handlers call.
 from __future__ import annotations
 import asyncio
 import time
-from models import IncomingMessage, QueryResult
-from services.query_parser import get_query_parser
-from services.query_engine import get_query_engine
-from services.response_formatter import get_formatter
-from utils.logger import get_logger
+from app.models.models import IncomingMessage, QueryResult
+from app.services.query_parser import get_query_parser
+from app.services.query_engine import get_query_engine
+from app.services.response_formatter import get_formatter
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -77,14 +77,14 @@ class QueryOrchestrator:
         logger.info("query_complete", ms=elapsed, success=result.success)
 
         # Append debug timing in dev mode
-        from config import get_settings
+        from app.config import get_settings
         if get_settings().is_dev:
             response_text += f"\n\n`[{elapsed}ms total | engine: {result.execution_time_ms}ms]`"
 
         return response_text
 
     async def _refresh_sheet(self) -> str:
-        from services.sheets_service import get_sheets_service
+        from app.services.sheets_service import get_sheets_service
         loop = asyncio.get_event_loop()
         try:
             svc = get_sheets_service()

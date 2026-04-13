@@ -14,13 +14,13 @@ import time
 import math
 import pandas as pd
 import numpy as np
-from models import (
+from app.models.models import (
     StructuredQuery, QueryResult, FilterOperator,
     AggregationType, OutputFormat
 )
-from services.sheets_service import get_sheets_service
-from utils.validators import validate_query, ValidationError
-from utils.logger import get_logger
+from app.services.sheets_service import get_sheets_service
+from app.utils.validators import validate_query, ValidationError
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 

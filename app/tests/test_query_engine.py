@@ -9,11 +9,11 @@ import pytest
 import pandas as pd
 from unittest.mock import MagicMock, patch
 
-from models import (
+from app.models.models import (
     StructuredQuery, FilterCondition, FilterOperator,
     AggregationType, OutputFormat
 )
-from services.query_engine import QueryEngine
+from app.services.query_engine import QueryEngine
 
 
 # ─── Fixtures ────────────────────────────────────────────────────────────────

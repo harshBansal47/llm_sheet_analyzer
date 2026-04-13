@@ -4,7 +4,7 @@ from telegram import Update
 from app.bots.telegram import get_telegram_app
 from app.bots.whatsapp import process_whatsapp_event
 from app.config import get_settings
-from utils.logger import get_logger
+from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter(tags=["bot"])

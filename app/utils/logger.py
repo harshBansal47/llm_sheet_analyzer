@@ -4,7 +4,7 @@ utils/logger.py  –  Structured JSON logging using structlog.
 import logging
 import sys
 import structlog
-from config import get_settings
+from app.config import get_settings
 
 
 def setup_logging() -> None:

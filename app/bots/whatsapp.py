@@ -9,10 +9,10 @@ Docs: https://developers.facebook.com/docs/whatsapp/cloud-api
 """
 from __future__ import annotations
 import httpx
-from models import IncomingMessage
-from services.query_orchestrator import get_orchestrator
-from utils.logger import get_logger
-from config import get_settings
+from app.models.models import IncomingMessage
+from app.services.query_orchestrator import get_orchestrator
+from app.utils.logger import get_logger
+from app.config import get_settings
 
 logger = get_logger(__name__)
 

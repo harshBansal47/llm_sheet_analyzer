@@ -1,20 +1,16 @@
 from __future__ import annotations
-import time
+import asyncio
 from contextlib import asynccontextmanager
  
-from fastapi import FastAPI, Request, Header, HTTPException, Depends
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
  
 from app.bots.telegram import get_telegram_app, setup_webhook
-from config import get_settings
-from models import IncomingMessage
-from services.query_orchestrator import get_orchestrator
-from services.sheets_service import get_sheets_service
-from utils.logger import setup_logging, get_logger
+from app.config import get_settings
+from app.services.sheets_service import get_sheets_service
+from app.utils.logger import setup_logging, get_logger
+from app.routes import bot, query
 
- 
 # ─────────────────────────────────────────────────────────────────────────────
 # App lifecycle
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,8 +25,14 @@ async def lifespan(app: FastAPI):
     logger.info("warming_sheet_cache")
     try:
         svc = get_sheets_service()
-        svc.get_dataframe(force_refresh=True)
+        # Keep startup responsive if Google API is slow/unreachable.
+        await asyncio.wait_for(
+            asyncio.to_thread(svc.get_dataframe, force_refresh=True),
+            timeout=20,
+        )
         logger.info("sheet_cache_warmed")
+    except asyncio.TimeoutError:
+        logger.warning("sheet_warm_timeout")
     except Exception as exc:
         logger.error("sheet_warm_failed", error=str(exc))
  
@@ -49,6 +51,8 @@ async def lifespan(app: FastAPI):
     logger.info("app_shutdown")
  
  
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # App instance
 # ─────────────────────────────────────────────────────────────────────────────
@@ -59,12 +63,18 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
- 
+
+settings = get_settings()
+cors_origins = ["*"] if settings.is_dev else []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
- 
-logger = get_logger(__name__)
+
+
+
+app.include_router(bot.router)
+app.include_router(query.router)

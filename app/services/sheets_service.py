@@ -17,9 +17,9 @@ import datetime
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from utils.cache import get_sheet_cache
-from utils.logger import get_logger
-from config import get_settings
+from app.utils.cache import get_sheet_cache
+from app.utils.logger import get_logger
+from app.config import get_settings
 
 logger = get_logger(__name__)
 
