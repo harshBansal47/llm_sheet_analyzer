@@ -31,12 +31,26 @@ logger = get_logger(__name__)
 # Dynamic system prompt  (unchanged from v2 — provider-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_system_prompt(schema: dict[str, dict[str, str]]) -> str:
+def _build_system_prompt(schema: dict[str, dict]) -> str:
     schema_lines: list[str] = []
     for tab_name, columns in schema.items():
         schema_lines.append(f'\nSheet tab: "{tab_name}"')
-        for col_name, col_type in columns.items():
-            schema_lines.append(f'  - "{col_name}" ({col_type})')
+        for col_name, meta in columns.items():
+            col_type = meta.get("type", "text")
+            if col_type == "numeric":
+                mn         = meta.get("min")
+                mx         = meta.get("max")
+                scale_hint = meta.get("scale_hint", "")
+                range_str  = f"{mn} to {mx}" if mn is not None else "unknown range"
+                schema_lines.append(
+                    f'  - "{col_name}" (numeric | {scale_hint} | actual range: {range_str})'
+                )
+            else:
+                samples    = meta.get("samples", [])
+                sample_str = ", ".join(f'"{v}"' for v in samples) if samples else "no data"
+                schema_lines.append(
+                    f'  - "{col_name}" (text | sample values: {sample_str})'
+                )
 
     schema_block = "\n".join(schema_lines)
     tab_list     = ", ".join(f'"{t}"' for t in schema.keys())
@@ -89,6 +103,15 @@ RULES:
 7.  "what percent …"  → aggregation=percentage, set numerator_field + denominator_field
 8.  "list / show …"   → aggregation=list
 9.  Ambiguous query   → clarification_needed=true, explain in clarification_message
+10. DECIMAL RATIO COLUMNS: If a numeric column has scale_hint "decimal ratio 0-1",
+    user phrases like "greater than 50%" must be converted to 0.50 in the filter value.
+    Never use the raw percentage number (50) for a 0-1 column.
+11. COLUMN MAPPING: Only filter on columns that actually exist in the schema above.
+    If the user mentions a concept (e.g. "court case", "defaulter") and NO column
+    in the schema clearly maps to it, set clarification_needed=true and ask which
+    column represents that concept. Never guess a semantically unrelated column.
+12. TEXT VALUE MATCHING: Use sample values shown in the schema to determine the
+    correct filter value and casing. E.g. if samples show "New" not "new", use "New".
 """
 
 

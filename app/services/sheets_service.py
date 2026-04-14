@@ -254,11 +254,59 @@ class SheetsService:
                 df[col] = cleaned
         return df
 
-    def _infer_column_types(self, df: pd.DataFrame) -> dict[str, str]:
-        return {
-            col: NUMERIC if pd.api.types.is_numeric_dtype(df[col]) else TEXT
-            for col in df.columns
-        }
+    def _infer_column_types(self, df: pd.DataFrame) -> dict[str, dict]:
+        result = {}
+
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                col_clean = df[col].dropna()
+
+                if col_clean.empty:
+                    result[col] = {
+                        "type": "numeric",
+                        "min": None,
+                        "max": None,
+                        "scale_hint": ""
+                    }
+                    continue
+
+                mn = float(col_clean.min())
+                mx = float(col_clean.max())
+
+                # Detect if values are integers (avoid misclassifying IDs)
+                all_integers = (col_clean % 1 == 0).all()
+
+                if mx <= 1.0 and mn >= 0.0 and not all_integers:
+                    scale_hint = "decimal ratio 0-1 (e.g. 0.75 = 75%)"
+                elif mx <= 100.0 and mn >= 0.0:
+                    scale_hint = "percentage 0-100"
+                else:
+                    scale_hint = f"range {mn} to {mx}"
+
+                result[col] = {
+                    "type": "numeric",
+                    "min": round(mn, 4),
+                    "max": round(mx, 4),
+                    "scale_hint": scale_hint,
+                }
+
+            else:
+                samples = (
+                    df[col]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .loc[lambda s: s != ""]
+                    .unique()
+                    .tolist()[:10]
+                )
+
+                result[col] = {
+                    "type": "text",
+                    "samples": samples
+                }
+
+        return result
 
     # ──────────────────────────────────────────────────────────────────────────
     # Internal helper
