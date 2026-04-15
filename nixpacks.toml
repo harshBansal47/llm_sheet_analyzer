@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["python313", "gcc", "libffi"]
+
+[phases.install]
+cmds = [
+    "pip install uv",
+    "uv sync --frozen --no-dev"
+]
+
+[start]
+cmd = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"

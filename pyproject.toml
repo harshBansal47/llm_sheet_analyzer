@@ -15,10 +15,14 @@ dependencies = [
     "openai>=2.31.0",
     "pandas>=3.0.2",
     "pyarrow>=23.0.1",
-    "pytest>=9.0.3",
     "python-telegram-bot>=22.7",
     "structlog>=25.5.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
