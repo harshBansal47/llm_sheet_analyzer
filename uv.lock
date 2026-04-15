@@ -735,9 +735,13 @@ dependencies = [
     { name = "openai" },
     { name = "pandas" },
     { name = "pyarrow" },
-    { name = "pytest" },
     { name = "python-telegram-bot" },
     { name = "structlog" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -752,10 +756,12 @@ requires-dist = [
     { name = "openai", specifier = ">=2.31.0" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pyarrow", specifier = ">=23.0.1" },
-    { name = "pytest", specifier = ">=9.0.3" },
     { name = "python-telegram-bot", specifier = ">=22.7" },
     { name = "structlog", specifier = ">=25.5.0" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.0.3" }]
 
 [[package]]
 name = "markdown-it-py"
