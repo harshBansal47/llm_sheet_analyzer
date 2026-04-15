@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import time
 import datetime
 import threading
@@ -145,8 +146,9 @@ class SheetsService:
 
     def _get_drive_client(self):
         if self._drive is None:
-            creds = Credentials.from_service_account_file(
-                self._settings.google_service_account_file,
+            creds_dict = json.loads(self._settings.google_credentials_json)
+            creds = Credentials.from_service_account_info(
+                creds_dict,
                 scopes=SCOPES,
             )
             self._drive = google_build("drive", "v3", credentials=creds, cache_discovery=False)

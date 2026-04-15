@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # ── Google Sheets ─────────────────────────────────────────────────────────
     google_service_account_file: Path = base_dir / "credentials.json"
     google_sheet_id: str 
+    google_credentials_json: str = ""
 
     # ── OpenAI (NL parsing ONLY) ──────────────────────────────────────────────
     openai_api_key: str
