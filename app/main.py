@@ -40,6 +40,7 @@ async def lifespan(app: FastAPI):
     if settings.telegram_bot_token:
         tg_app = get_telegram_app()
         await tg_app.initialize()
+        await tg_app.start()
         await setup_webhook(tg_app)
         logger.info("telegram_ready")
  
@@ -47,6 +48,7 @@ async def lifespan(app: FastAPI):
  
     # Shutdown
     if settings.telegram_bot_token:
+        await get_telegram_app().stop()
         await get_telegram_app().shutdown()
     logger.info("app_shutdown")
  

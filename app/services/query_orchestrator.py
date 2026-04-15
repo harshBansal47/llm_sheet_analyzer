@@ -136,7 +136,7 @@ class QueryOrchestrator:
             "👋 *Data Query Bot*\n\n"
             f"Available sheets: {tab_list}\n\n"
             "Ask natural language questions. Examples:\n\n"
-            "• _What percent has been received for Ahmed Ali?_\n"
+            "• _What percent has been received for Customer A?_\n"
             "• _How many customers paid more than 70%?_\n"
             "• _Total cost and received amount for unit A-302_\n"
             "• _Show all records in Phase 2 with payment below 50%_\n"
