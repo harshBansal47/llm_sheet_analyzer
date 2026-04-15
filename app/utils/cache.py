@@ -88,19 +88,17 @@ class ParquetCache:
             return None
 
     def save_metadata(self, sheet_modified_time: str) -> None:
-        """Persist modifiedTime and fetch timestamp to metadata.json."""
         with self._lock:
             self._metadata = {
                 "sheet_modified_time": sheet_modified_time,
                 "cached_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
                 "tabs": list(self._dataframes.keys()),
+                "schema": self._schema   # ✅ ADD THIS
             }
-            try:
-                (self._dir / METADATA_FILE).write_text(
-                    json.dumps(self._metadata, indent=2)
-                )
-            except Exception as exc:
-                logger.error("metadata_write_error", error=str(exc))
+
+            (self._dir / METADATA_FILE).write_text(
+                json.dumps(self._metadata, indent=2)
+            )
 
     def get_cached_at(self) -> str:
         with self._lock:
@@ -174,13 +172,15 @@ class ParquetCache:
         with self._lock:
             self._dataframes = loaded
             # Rebuild schema from loaded DataFrames
-            self._schema = {
-                tab: {
-                    col: "numeric" if pd.api.types.is_numeric_dtype(df[col]) else "text"
-                    for col in df.columns
-                }
-                for tab, df in loaded.items()
-            }
+            meta_path = self._dir / METADATA_FILE
+
+            if meta_path.exists():
+                try:
+                    data = json.loads(meta_path.read_text())
+                    self._metadata = data
+                    self._schema = data.get("schema", {})
+                except Exception as exc:
+                    logger.warning("metadata_read_error", error=str(exc))
 
         logger.info("parquet_cache_loaded_into_memory", tabs=list(loaded.keys()))
         return True

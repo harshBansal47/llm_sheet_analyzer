@@ -201,7 +201,7 @@ class SheetsService:
 
                 df = pd.DataFrame(records)
                 # Drop padding columns/rows Google Sheets sometimes adds
-                df = df.loc[:, df.astype(str).ne("").any(axis=0)]
+                # df = df.loc[:, df.astype(str).ne("").any(axis=0)]
                 df = df[df.astype(str).ne("").any(axis=1)].reset_index(drop=True)
 
                 if df.empty:
@@ -247,19 +247,48 @@ class SheetsService:
             success_rate = parsed.notna().sum() / len(non_empty)
             if success_rate >= threshold:
                 df[col] = pd.to_numeric(
-                    cleaned.replace({"": float("nan"), "nan": float("nan")}),
-                    errors="coerce",
+                    cleaned.replace({"": None, "nan": None}),
+                    errors="coerce"
                 )
             else:
                 df[col] = cleaned
         return df
 
     def _infer_column_types(self, df: pd.DataFrame) -> dict[str, dict]:
+        """
+        Return rich per-column metadata for LLM + query engine.
+
+        Handles:
+        - Empty columns
+        - Numeric columns (with range + scale hints)
+        - Text columns (with sample values)
+        """
+
         result = {}
 
         for col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[col]):
-                col_clean = df[col].dropna()
+            col_series = df[col]
+
+            # ─────────────────────────────────────────────
+            # 1. Detect completely empty column
+            # ─────────────────────────────────────────────
+            is_empty = (
+                col_series.isna().all() or
+                col_series.astype(str).str.strip().eq("").all()
+            )
+
+            if is_empty:
+                result[col] = {
+                    "type": "empty",
+                    "note": "column exists but has no data yet"
+                }
+                continue
+
+            # ─────────────────────────────────────────────
+            # 2. Numeric column
+            # ─────────────────────────────────────────────
+            if pd.api.types.is_numeric_dtype(col_series):
+                col_clean = col_series.dropna()
 
                 if col_clean.empty:
                     result[col] = {
@@ -273,12 +302,13 @@ class SheetsService:
                 mn = float(col_clean.min())
                 mx = float(col_clean.max())
 
-                # Detect if values are integers (avoid misclassifying IDs)
+                # Detect integer-only column (likely ID/category)
                 all_integers = (col_clean % 1 == 0).all()
 
-                if mx <= 1.0 and mn >= 0.0 and not all_integers:
+                # Detect scale
+                if 0.0 <= mn and mx <= 1.0 and not all_integers:
                     scale_hint = "decimal ratio 0-1 (e.g. 0.75 = 75%)"
-                elif mx <= 100.0 and mn >= 0.0:
+                elif 0.0 <= mn and mx <= 100.0:
                     scale_hint = "percentage 0-100"
                 else:
                     scale_hint = f"range {mn} to {mx}"
@@ -290,16 +320,20 @@ class SheetsService:
                     "scale_hint": scale_hint,
                 }
 
+            # ─────────────────────────────────────────────
+            # 3. Text column
+            # ─────────────────────────────────────────────
             else:
-                samples = (
-                    df[col]
+                cleaned = (
+                    col_series
                     .dropna()
                     .astype(str)
                     .str.strip()
-                    .loc[lambda s: s != ""]
-                    .unique()
-                    .tolist()[:10]
                 )
+
+                non_empty = cleaned[cleaned != ""]
+
+                samples = non_empty.unique().tolist()[:10]
 
                 result[col] = {
                     "type": "text",

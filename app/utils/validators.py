@@ -19,21 +19,38 @@ class ValidationError(Exception):
         self.message = message
         super().__init__(message)
 
-
 def validate_query(
     query: StructuredQuery,
     available_columns: list[str],
-    tab_schema: dict[str, str] | None = None,
+    tab_schema: dict[str, dict] | None = None,
 ) -> None:
     """
-    Raises ValidationError with a user-friendly message if the query is
-    structurally invalid or references non-existent fields.
+    Validate StructuredQuery against available columns and schema.
 
-    tab_schema: { col_name: "numeric" | "text" }  (optional but recommended)
+    Supports both:
+    - old schema: { col: "numeric" }
+    - new schema: { col: { "type": "numeric", ... } }
     """
+
     tab_schema = tab_schema or {}
 
+    # ─────────────────────────────────────────────
+    # Helper: extract column type safely
+    # ─────────────────────────────────────────────
+    def _get_col_type(field: str) -> str | None:
+        meta = tab_schema.get(field)
+
+        if isinstance(meta, str):      # backward compatibility
+            return meta
+
+        if isinstance(meta, dict):     # new schema
+            return meta.get("type")
+
+        return None
+
+    # ─────────────────────────────────────────────
     # 1. Confidence gate
+    # ─────────────────────────────────────────────
     if query.confidence < 0.60:
         raise ValidationError(
             "I'm not confident I understood your question correctly. "
@@ -41,11 +58,15 @@ def validate_query(
             + (f"\n(Hint: {query.clarification_message})" if query.clarification_message else "")
         )
 
-    # 2. Parser explicitly requested clarification
+    # ─────────────────────────────────────────────
+    # 2. Parser clarification
+    # ─────────────────────────────────────────────
     if query.clarification_needed:
         raise ValidationError(query.clarification_message or "Please clarify your question.")
 
-    # 3. Filter fields must exist in the tab
+    # ─────────────────────────────────────────────
+    # 3. Column existence check
+    # ─────────────────────────────────────────────
     for f in query.filters:
         if f.field not in available_columns:
             close = _suggest_close(f.field, available_columns)
@@ -54,19 +75,30 @@ def validate_query(
                 + (f" Did you mean \"{close}\"?" if close else "")
             )
 
-    # 4. Numeric operators must be used on numeric columns (when schema known)
+    # ─────────────────────────────────────────────
+    # 4. Numeric operator validation
+    # ─────────────────────────────────────────────
     if tab_schema:
         for f in query.filters:
             op = f.operator if isinstance(f.operator, str) else f.operator.value
+
             if op in NUMERIC_OPERATORS:
-                col_type = tab_schema.get(f.field, "text")
+                col_type = _get_col_type(f.field)
+
+                if col_type == "empty":
+                    raise ValidationError(
+                        f"Column \"{f.field}\" has no data yet, cannot apply numeric filter."
+                    )
+
                 if col_type != "numeric":
                     raise ValidationError(
                         f"Cannot apply numeric comparison ('{op}') on "
                         f"non-numeric column \"{f.field}\"."
                     )
 
-    # 5. Aggregation field checks
+    # ─────────────────────────────────────────────
+    # 5. Aggregation validation
+    # ─────────────────────────────────────────────
     agg = query.aggregation if isinstance(query.aggregation, str) else query.aggregation.value
 
     if agg in ("sum", "average", "min", "max") and not query.target_field:
@@ -80,13 +112,16 @@ def validate_query(
             raise ValidationError(
                 "Percentage calculation needs both a numerator column and a denominator column."
             )
-        # Both must be numeric
+
         if tab_schema:
             for field_name in (query.numerator_field, query.denominator_field):
-                if field_name and tab_schema.get(field_name) != "numeric":
-                    raise ValidationError(
-                        f"Percentage calculation: column \"{field_name}\" must be numeric."
-                    )
+                if field_name:
+                    col_type = _get_col_type(field_name)
+
+                    if col_type != "numeric":
+                        raise ValidationError(
+                            f"Percentage calculation: column \"{field_name}\" must be numeric."
+                        )
 
 
 def _suggest_close(field: str, available: list[str]) -> str | None:

@@ -71,7 +71,10 @@ class ResponseFormatter:
                    else f"No records found.\nData as of {ts}"
 
         # Determine which fields to show (most informative ones)
-        field_priority = self._get_field_priority(rows[0]) if rows else []
+        field_priority = self._get_field_priority(
+            rows[0],
+            result.structured_query.display_fields if result.structured_query else None
+        )
         
         # Header
         parts = [f"📋 {b}{n} record{'s' if n != 1 else ''} found{b}", ""]
@@ -100,78 +103,69 @@ class ResponseFormatter:
         
         return "\n".join(parts)
 
-    def _get_field_priority(self, sample_row: dict) -> list:
+    def _get_field_priority(
+    self,
+    sample_row: dict,
+    display_fields: list | None = None,
+) -> list:
         """
-        Determine which fields to show first based on data characteristics.
-        Completely automatic - no hardcoded field names.
-        """
-        fields = []
-        
-        for key, val in sample_row.items():
-            if key.startswith('_'):  # Skip internal fields
-                continue
-            
-            priority = 0
-            key_lower = key.lower()
-            
-            # Heuristics for field importance (still schema-agnostic)
-            if any(word in key_lower for word in ['id', 'name', 'title']):
-                priority += 10
-            if any(word in key_lower for word in ['amount', 'price', 'cost', 'value']):
-                priority += 5
-            if any(word in key_lower for word in ['date', 'time', 'year']):
-                priority += 3
-            
-            # Numeric fields often contain key metrics
-            try:
-                float(val)
-                priority += 2
-            except (ValueError, TypeError):
-                pass
-            
-            fields.append((key, priority))
-        
-        # Sort by priority, return top fields
-        fields.sort(key=lambda x: x[1], reverse=True)
-        return [f[0] for f in fields[:MAX_FIELDS_PER_ROW]]
+        Determine which fields to display.
 
-    def _format_inline_row(self, idx: int, row: dict, priority_fields: list, md: bool) -> str:
+        Rules:
+        1. If parser provided display_fields → use them (trusted source)
+        2. Else → fallback to schema order (as-is, no guessing)
+        3. Always exclude internal fields (starting with "_")
         """
-        Format a single row in a compact, inline style.
-        Example: #1 | ID: 33 | Age: 59 | Income: ₹131k | Score: 80%
+
+        # ── Case 1: Use parser-defined fields ─────────────────────────────
+        if display_fields:
+            return [
+                f for f in display_fields
+                if f in sample_row and not f.startswith("_")
+            ][:MAX_FIELDS_PER_ROW]
+
+        # ── Case 2: Fallback → natural column order ───────────────────────
+        fields = [
+            k for k in sample_row.keys()
+            if not k.startswith("_")
+        ]
+
+        return fields[:MAX_FIELDS_PER_ROW]
+
+    def _format_inline_row(
+    self,
+    idx: int,
+    row: dict,
+    fields: list,
+    md: bool
+) -> str:
+        """
+        Generic row formatter:
+        Uses only provided fields, no assumptions.
         """
         b = "**" if md else ""
-        
-        # Start with record number
         parts = [f"{b}#{idx}{b}"]
-        
-        # Add tab info if present
+
+        # Show tab name if present
         if "_source_tab" in row:
-            parts.append(f"_[{row['_source_tab']}]_" if md else f"[{row['_source_tab']}]")
-        
-        # Build inline field-value pairs
+            parts.append(
+                f"_[{row['_source_tab']}]_" if md
+                else f"[{row['_source_tab']}]"
+            )
+
         field_values = []
-        
-        # First show priority fields
-        for field in priority_fields:
+
+        for field in fields:
             if field in row:
                 val = row[field]
-                if val and val not in ("", "nan", "None", None):
-                    formatted = self._format_value_compact(field, val)
-                    field_values.append(formatted)
-        
-        # If we have room, add other fields
-        other_fields = [f for f in row.keys() if f not in priority_fields and not f.startswith('_')]
-        for field in other_fields[:3]:  # Add at most 3 extra fields
-            val = row[field]
-            if val and val not in ("", "nan", "None", None):
-                formatted = self._format_value_compact(field, val)
-                field_values.append(formatted)
-        
-        # Join everything with separators
+                if val not in ("", None, "nan"):
+                    field_values.append(
+                        self._format_value_compact(field, val)
+                    )
+
         if field_values:
             parts.append(" • " + " • ".join(field_values))
-        
+
         return "".join(parts)
 
     def _format_value_compact(self, field: str, value) -> str:

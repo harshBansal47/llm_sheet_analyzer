@@ -37,6 +37,10 @@ def _build_system_prompt(schema: dict[str, dict]) -> str:
         schema_lines.append(f'\nSheet tab: "{tab_name}"')
         for col_name, meta in columns.items():
             col_type = meta.get("type", "text")
+            if col_type == "empty":
+                schema_lines.append(
+                    f'  - "{col_name}" (empty column | no data available yet)'
+                )
             if col_type == "numeric":
                 mn         = meta.get("min")
                 mx         = meta.get("max")
