@@ -196,6 +196,66 @@ BEHAVIOR SUMMARY
 
 """
 
+
+def _build_header_row_detection_prompt(rows_preview: list[list[str]]) -> str:
+    """
+    Build a prompt that lets Claude decide which row is the header
+    by seeing ALL candidate rows at once — not just one row's values.
+
+    Why multi-row context matters:
+      - A header row is only meaningful relative to what comes after it.
+      - Seeing Row 0 = ["Name", "Amount", "Date"] vs Row 1 = ["Alice", "5000", "2024-01-01"]
+        is far more reliable than inspecting one row in isolation.
+
+    Args:
+        rows_preview: First N rows of the sheet, each row as a list of
+                      raw cell strings (integer-indexed, no header yet).
+
+    Returns:
+        Prompt string to send to the LLM.
+    """
+    if not rows_preview:
+        raise ValueError("rows_preview must contain at least one row")
+
+    # Format each row for readability
+    rows_block = "\n".join(
+        f'  Row {i}: {[str(cell).strip() for cell in row]}'
+        for i, row in enumerate(rows_preview)
+    )
+
+    return f"""You are analysing raw spreadsheet data that was loaded WITHOUT any header row.
+
+Below are the first rows of the sheet (0-indexed). Each row is shown as a Python list of raw cell strings:
+
+{rows_block}
+
+Your task: identify which row index (0-based) is the HEADER row — the row that contains
+column names rather than actual data values.
+
+SIGNALS that a row is a HEADER (high weight):
+  • Cells are short descriptive labels  (e.g. "Customer Name", "Invoice Date", "Total Amount")
+  • Cells contain words, not numbers or dates
+  • No currency symbols, percentages, or numeric formatting
+  • Values are unique within the row (no repeated labels)
+  • The rows that follow it look like data records (numbers, dates, names, IDs)
+
+SIGNALS that a row is DATA (not a header):
+  • Cells contain numeric values, dates, or currency amounts
+  • Cells contain proper nouns, IDs, or codes  (e.g. "A-302", "INV-001", "John Smith")
+  • Cells repeat patterns seen in other data rows
+
+EDGE CASES:
+  • If Row 0 contains headers but Row 1 is a sub-header (e.g. units row), return 0.
+  • If the very first row is clearly data and no header row exists, return 0.
+  • If multiple rows could be headers, return the LOWEST index.
+
+Return ONLY a valid JSON object — no explanation, no markdown:
+{{
+    "header_row_index": <integer — the 0-based row index of the header>,
+    "confidence": <float between 0.0 and 1.0>,
+    "reason": "<one short sentence explaining your choice>"
+}}"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # QueryParser
 # ─────────────────────────────────────────────────────────────────────────────

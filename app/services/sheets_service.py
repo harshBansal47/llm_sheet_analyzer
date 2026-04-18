@@ -1,7 +1,7 @@
 from __future__ import annotations
+import asyncio
 import json
 import time
-import datetime
 import threading
 import pandas as pd
 import gspread
@@ -9,6 +9,8 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build as google_build
 from googleapiclient.errors import HttpError
 
+from app.services.llm_client import get_llm_client
+from app.services.query_parser import _build_header_row_detection_prompt
 from app.utils.cache import get_parquet_cache, ParquetCache
 from app.utils.logger import get_logger
 from app.config import get_settings
@@ -55,7 +57,9 @@ class SheetsService:
 
         self._gspread: gspread.Client | None = None
         self._drive = None
-        self._fetch_lock = threading.Lock()
+
+        # asyncio.Lock instead of threading.Lock — get_all_dataframes is now async
+        self._fetch_lock = asyncio.Lock()
 
         try:
             self._cache.load_from_disk()
@@ -66,12 +70,13 @@ class SheetsService:
     # Public API
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_all_dataframes(self, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
+    async def get_all_dataframes(self, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
         t0 = time.monotonic()
 
         # ── 1. Get current modifiedTime from Drive API ────────────────────────
+        # _get_sheet_modified_time is sync (blocking HTTP) — run in thread pool
         try:
-            current_modified = self._get_sheet_modified_time()
+            current_modified = await asyncio.to_thread(self._get_sheet_modified_time)
         except CredentialsError:
             raise
         except Exception as exc:
@@ -124,7 +129,8 @@ class SheetsService:
         )
         logger.info("sheet_data_stale_fetching", reason=change_reason)
 
-        with self._fetch_lock:
+        # asyncio.Lock used with async with — prevents concurrent fetches
+        async with self._fetch_lock:
             if not force_refresh:
                 try:
                     latest_stored = self._cache.get_stored_modified_time()
@@ -134,6 +140,7 @@ class SheetsService:
                 except Exception as exc:
                     logger.warning("concurrent_fetch_cache_check_failed", error=str(exc))
 
+            # _fetch_all_tabs is sync (blocking gspread calls) — run in thread pool
             try:
                 all_dfs = self._fetch_all_tabs()
             except SheetFetchError:
@@ -143,6 +150,9 @@ class SheetsService:
 
             if not all_dfs:
                 raise SheetFetchError("No tabs were fetched — spreadsheet may be empty or inaccessible.")
+
+            # _normalize_all_dfs is async — calls AI for header detection
+            all_dfs = await self._normalize_all_dfs(all_dfs)
 
             try:
                 schema = {tab: self._infer_column_types(df) for tab, df in all_dfs.items()}
@@ -168,33 +178,120 @@ class SheetsService:
         )
         return {k: v.copy() for k, v in all_dfs.items()}
 
-    def sync_dataframe(self, force_refresh: bool = False) -> pd.DataFrame | None:
+    # ──────────────────────────────────────────────────────────────────────────
+    # Normalization
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def _normalize_all_dfs(self, all_dfs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+        cleaned = {}
+        for tab, df in all_dfs.items():
+            try:
+                header_row = await self._detect_header_row(df)
+                new_df = self._apply_header(df, header_row)
+                new_df = self._coerce_types(new_df)
+                cleaned[tab] = new_df
+                logger.info(
+                    "tab_normalized",
+                    tab=tab,
+                    header_row=header_row,
+                    rows=len(new_df),
+                    cols=list(new_df.columns),
+                )
+            except Exception as exc:
+                logger.warning("df_normalization_failed", tab=tab, error=str(exc))
+                cleaned[tab] = df  # fallback: return raw df untouched
+        return cleaned
+
+    async def _detect_header_row(self, df: pd.DataFrame) -> int:
+        """
+        Use the configured LLM to detect which row (0-based) is the header row.
+        Falls back to row 0 if AI call fails or returns an invalid index.
+        """
+        LOOK_AT_ROWS = min(6, len(df))
+
+        rows_preview = [
+            df.iloc[i].astype(str).str.strip().tolist()
+            for i in range(LOOK_AT_ROWS)
+        ]
+
+        system_prompt = _build_header_row_detection_prompt(rows_preview)
+
+        rows_block = "\n".join(
+            f"  Row {i}: {row}"
+            for i, row in enumerate(rows_preview)
+        )
+        user_prompt = (
+            f"Identify which row is the header row containing column names.\n\n"
+            f"Return ONLY valid JSON with keys: header_row_index, confidence, reason."
+        )
+
         try:
-            all_dfs = self.get_all_dataframes(force_refresh=force_refresh)
-            return all_dfs
+            client = get_llm_client()
+            raw_json = await client.complete(system_prompt, user_prompt)
+
+            # Strip markdown fences — some providers add them despite instructions
+            raw_json = raw_json.strip()
+            if raw_json.startswith("```"):
+                lines    = raw_json.splitlines()
+                raw_json = "\n".join(
+                    line for line in lines
+                    if not line.strip().startswith("```")
+                ).strip()
+
+            response = json.loads(raw_json)
+            index    = int(response["header_row_index"])
+
+            if not (0 <= index < LOOK_AT_ROWS):
+                raise ValueError(f"header_row_index {index} out of range 0–{LOOK_AT_ROWS - 1}")
+
+            logger.info(
+                "ai_header_detection_success",
+                detected_row=index,
+                confidence=response.get("confidence"),
+                reason=response.get("reason"),
+            )
+            return index
+
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            logger.warning("header_row_detection_bad_response", error=str(exc))
+            return 0
+
+        except Exception as exc:
+            logger.warning("header_row_detection_failed", error=str(exc))
+            return 0
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Public helpers
+    # ──────────────────────────────────────────────────────────────────────────
+
+    async def sync_dataframe(self, force_refresh: bool = False) -> dict[str, pd.DataFrame] | None:
+        """Async wrapper — kept for call-site compatibility."""
+        try:
+            return await self.get_all_dataframes(force_refresh=force_refresh)
         except SheetsServiceError:
             raise
         except Exception as exc:
             raise SheetFetchError(f"sync_dataframe failed: {exc}") from exc
 
-    def get_schema(self, force_refresh: bool = False) -> dict[str, dict[str, str]]:
+    async def get_schema(self, force_refresh: bool = False) -> dict[str, dict[str, str]]:
         try:
-            self.get_all_dataframes(force_refresh=force_refresh)
+            await self.get_all_dataframes(force_refresh=force_refresh)
         except Exception as exc:
             logger.warning("get_schema_refresh_failed_returning_stale", error=str(exc))
-
         try:
             return self._cache.get_schema()
         except Exception as exc:
             raise CacheError(f"Failed to retrieve schema from cache: {exc}") from exc
 
-    def get_tab_names(self) -> list[str]:
+    async def get_tab_names(self) -> list[str]:
         try:
-            return list(self.get_all_dataframes().keys())
+            dfs = await self.get_all_dataframes()
+            return list(dfs.keys())
         except Exception as exc:
             raise SheetFetchError(f"Failed to get tab names: {exc}") from exc
 
     def last_refreshed_str(self) -> str:
+        """Sync — reads from local cache only, no I/O."""
         try:
             cached_at = self._cache.get_cached_at()
             if cached_at == "never":
@@ -205,7 +302,7 @@ class SheetsService:
             return "unknown"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Drive API  –  modifiedTime check
+    # Drive API  –  modifiedTime check  (sync — wrapped in to_thread above)
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_drive_client(self):
@@ -236,6 +333,7 @@ class SheetsService:
         return self._drive
 
     def _get_sheet_modified_time(self) -> str:
+        """Sync — called via asyncio.to_thread() from get_all_dataframes."""
         try:
             drive = self._get_drive_client()
         except CredentialsError:
@@ -244,7 +342,15 @@ class SheetsService:
             raise SheetsServiceError(f"Failed to get Drive client: {exc}") from exc
 
         try:
-            result = drive.files().get(fileId="1H6cEKF-6kabeCmt7buU0xdeNG1Pw-XJaBKYweRuJoPQ", fields="modifiedTime", supportsAllDrives=True).execute()
+            result = (
+                drive.files()
+                .get(
+                    fileId=self._settings.google_sheet_id,
+                    fields="modifiedTime",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
         except HttpError as exc:
             if exc.resp.status == 404:
                 raise SheetFetchError(
@@ -252,9 +358,7 @@ class SheetsService:
                     "Check GOOGLE_SHEET_ID and service account permissions."
                 ) from exc
             elif exc.resp.status in (401, 403):
-                raise CredentialsError(
-                    f"Permission denied accessing spreadsheet: {exc}"
-                ) from exc
+                raise CredentialsError(f"Permission denied accessing spreadsheet: {exc}") from exc
             raise SheetsServiceError(f"Drive API HTTP error: {exc}") from exc
         except Exception as exc:
             raise SheetsServiceError(f"Drive API request failed: {exc}") from exc
@@ -265,7 +369,7 @@ class SheetsService:
             raise SheetsServiceError("Drive API response missing 'modifiedTime' field.") from exc
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Sheets API  –  full data fetch
+    # Sheets API  –  full data fetch  (sync — wrapped in to_thread above)
     # ──────────────────────────────────────────────────────────────────────────
 
     def _get_gspread_client(self) -> gspread.Client:
@@ -292,6 +396,12 @@ class SheetsService:
         return self._gspread
 
     def _fetch_all_tabs(self) -> dict[str, pd.DataFrame]:
+        """
+        Sync — called via asyncio.to_thread() from get_all_dataframes.
+        Fetches raw data from all worksheets using get_all_values() so that
+        NO row is pre-consumed as a header. _normalize_all_dfs() handles
+        header detection and promotion separately.
+        """
         t0 = time.monotonic()
 
         try:
@@ -327,11 +437,7 @@ class SheetsService:
         for worksheet in worksheets:
             tab = worksheet.title
             try:
-                records = worksheet.get_all_records(
-                    expected_headers=[],
-                    value_render_option="UNFORMATTED_VALUE",
-                    numericise_ignore=["all"],
-                )
+                raw = worksheet.get_all_values()
             except gspread.exceptions.APIError as exc:
                 logger.error("tab_fetch_api_error", tab=tab, error=str(exc))
                 continue
@@ -339,21 +445,20 @@ class SheetsService:
                 logger.error("tab_fetch_error", tab=tab, error=str(exc))
                 continue
 
-            if not records:
+            if not raw:
                 logger.warning("tab_empty_skipped", tab=tab)
                 continue
 
             try:
-                df = pd.DataFrame(records)
-                df = df[df.astype(str).ne("").any(axis=1)].reset_index(drop=True)
+                df = pd.DataFrame(raw)
+                df = df[df.apply(lambda r: r.str.strip().ne("").any(), axis=1)].reset_index(drop=True)
 
                 if df.empty:
                     logger.warning("tab_empty_after_clean", tab=tab)
                     continue
 
-                df = self._coerce_types(df)
                 result[tab] = df
-                logger.info("tab_fetched", tab=tab, rows=len(df), cols=list(df.columns))
+                logger.info("tab_fetched_raw", tab=tab, rows=len(df), cols=df.shape[1])
 
             except Exception as exc:
                 logger.error("tab_processing_error", tab=tab, error=str(exc))
@@ -368,8 +473,17 @@ class SheetsService:
         return result
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Type inference
+    # Type coercion & schema inference  (sync — pure pandas, no I/O)
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _apply_header(self, df: pd.DataFrame, header_row: int) -> pd.DataFrame:
+        """Promote the detected header row to column names and drop it from data."""
+        new_df = df.iloc[header_row:].reset_index(drop=True)
+        new_df.columns = new_df.iloc[0].astype(str).str.strip()
+        new_df = new_df[1:].reset_index(drop=True)
+        # Drop columns with empty names
+        new_df = new_df.loc[:, new_df.columns.str.strip().ne("")]
+        return new_df
 
     def _coerce_types(self, df: pd.DataFrame) -> pd.DataFrame:
         try:
@@ -405,13 +519,12 @@ class SheetsService:
                 if success_rate >= threshold:
                     df[col] = pd.to_numeric(
                         cleaned.replace({"": None, "nan": None}),
-                        errors="coerce"
+                        errors="coerce",
                     )
                 else:
                     df[col] = cleaned
             except Exception as exc:
                 logger.warning("coerce_types_column_failed", col=col, error=str(exc))
-                # Leave column as-is
 
         return df
 
@@ -422,7 +535,7 @@ class SheetsService:
             try:
                 col_series = df[col]
 
-                # ── 1. Detect completely empty column ─────────────────────────
+                # ── 1. Empty column ───────────────────────────────────────────
                 try:
                     is_empty = (
                         col_series.isna().all() or
@@ -440,7 +553,6 @@ class SheetsService:
                 if pd.api.types.is_numeric_dtype(col_series):
                     try:
                         col_clean = col_series.dropna()
-
                         if col_clean.empty:
                             result[col] = {"type": "numeric", "min": None, "max": None, "scale_hint": ""}
                             continue
@@ -484,10 +596,11 @@ class SheetsService:
         return result
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Internal helper
+    # Internal helpers
     # ──────────────────────────────────────────────────────────────────────────
 
     def _serve_from_cache_or_raise(self) -> dict[str, pd.DataFrame]:
+        """Sync — reads only from local memory/disk cache, no I/O."""
         try:
             if self._cache.has_memory_data():
                 return self._cache.get_dataframes()

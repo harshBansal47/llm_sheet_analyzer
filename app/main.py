@@ -25,11 +25,7 @@ async def lifespan(app: FastAPI):
     logger.info("warming_sheet_cache")
     try:
         svc = get_sheets_service()
-        # Keep startup responsive if Google API is slow/unreachable.
-        await asyncio.wait_for(
-            asyncio.to_thread(svc.sync_dataframe, force_refresh=True),
-            timeout=20,
-        )
+        await svc.sync_dataframe(force_refresh=True)
         logger.info("sheet_cache_warmed")
     except asyncio.TimeoutError:
         logger.warning("sheet_warm_timeout")
