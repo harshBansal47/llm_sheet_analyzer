@@ -2,10 +2,10 @@
 services/response_formatter.py  –  QueryResult → Telegram-optimised Message
 
 Output structure for row results:
-  📋 <N> records — <short intent summary>
+  📋 <N> records found
 
-  #1 · SN-001 · Name · Field1: val · Field2: val
-  #2 · SN-002 · Name · Field1: val · Field2: val
+  #1 · SN: 45 · M/S COGERS TRADEX PVT LTD · L-011
+  #2 · SN: 46 · Urmila Gupta · L-031
   ...
   _...and N more_
 
@@ -19,12 +19,14 @@ Scalar output:
   📅 Data as of <timestamp>
 
 Design rules:
+  - SN is ALWAYS injected at position 0 — client navigation anchor to find rows in sheet
   - One line per record (scannable in Telegram)
-  - SN shown first so users can reference rows easily
-  - Values auto-formatted (currency ₹, %, compact numbers)
+  - Values auto-formatted (currency ₹ Indian units, %, compact numbers)
   - No hardcoded field names — schema-agnostic
   - MAX 15 rows; remainder shown as count
   - Filters shown as compact pills at the bottom
+  - Name fields get 30 chars (not 22) — primary identifier deserves space
+  - Tower redundancy avoided when Apt No. already encodes it
 """
 from __future__ import annotations
 import math
@@ -34,13 +36,17 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_ROWS      = 15   # Maximum record lines in one message
-MAX_FIELDS    = 6    # Max fields shown per record line (excluding SN)
-MAX_VAL_LEN   = 22   # Truncate long string values to this length
-MAX_LABEL_LEN = 14   # Truncate long field names to this length
+MAX_ROWS       = 15   # Maximum record lines in one message
+MAX_FIELDS     = 6    # Max fields shown per record line (including SN)
+MAX_VAL_LEN    = 22   # Truncate generic string values to this length
+MAX_NAME_LEN   = 30   # Name/address fields get more space — primary identifier
+MAX_LABEL_LEN  = 14   # Truncate long field labels to this length
 
 # Fields that are purely internal — never shown to the user
 _INTERNAL_FIELDS = {"_source_tab"}
+
+# Column names treated as row identifiers (SN pinned first always)
+_SN_NAMES = {"SN", "S.NO", "SR", "SR.NO", "ID"}
 
 # Operator symbols for filter summary line
 _OP_SYMBOL: dict[str, str] = {
@@ -72,8 +78,12 @@ class ResponseFormatter:
 
     def format_whatsapp(self, result: QueryResult) -> str:
         """Plain-text version — same structure, no Markdown."""
-        return self.format_telegram(result)\
-            .replace("*", "").replace("_", "").replace("`", "")
+        return (
+            self.format_telegram(result)
+            .replace("*", "")
+            .replace("_", "")
+            .replace("`", "")
+        )
 
     def format_error(self, error_message: str) -> str:
         return f"❌ *Error*\n\n{error_message}"
@@ -95,7 +105,6 @@ class ResponseFormatter:
             f"  _(based on {n} matching record{'s' if n != 1 else ''})_",
         ]
 
-        # Filters summary
         filter_line = self._build_filter_summary(result)
         if filter_line:
             lines += ["", f"🎯 {filter_line}"]
@@ -115,25 +124,20 @@ class ResponseFormatter:
         if n == 0:
             return f"🔍 *No records found.*\n\n📅 _Data as of {ts}_"
 
-        # ── Summary header line ───────────────────────────────────────────────
         header = f"📋 *{n} record{'s' if n != 1 else ''} found*"
         lines  = [header, ""]
 
-        # ── Decide which fields to display ────────────────────────────────────
         display_fields = self._resolve_display_fields(rows[0], result)
 
-        # ── One line per record ───────────────────────────────────────────────
         for i, row in enumerate(rows[:MAX_ROWS], 1):
             lines.append(self._format_record_line(i, row, display_fields))
 
-        # ── "...and N more" tail ──────────────────────────────────────────────
         if n > MAX_ROWS:
             remaining = n - MAX_ROWS
             lines.append(
                 f"\n_...and {remaining} more record{'s' if remaining != 1 else ''}_"
             )
 
-        # ── Filter summary ────────────────────────────────────────────────────
         filter_line = self._build_filter_summary(result)
         if filter_line:
             lines += ["", f"🎯 {filter_line}"]
@@ -153,40 +157,38 @@ class ResponseFormatter:
         """
         Determine the ordered list of fields to show per record.
 
-        Priority:
-          1. Parser-provided display_fields (already curated)
-          2. All non-internal columns in schema order (capped at MAX_FIELDS)
-
-        SN (or the first column) is always shown first when present.
+        Rules (in priority order):
+          1. SN is ALWAYS injected at position 0 — non-negotiable navigation anchor.
+             Without SN the client cannot locate the record in a 700-row sheet.
+          2. If parser provided display_fields → use them after injecting SN.
+          3. Fallback → natural column order capped at MAX_FIELDS.
         """
         all_cols = [k for k in sample_row if k not in _INTERNAL_FIELDS]
 
-        # Parser specified fields explicitly
+        # Find the SN column in this row's keys
+        sn_col = next(
+            (c for c in all_cols if c.strip().upper() in _SN_NAMES),
+            None
+        )
+
+        # ── Case 1: Parser specified display_fields ───────────────────────────
         if result.structured_query and result.structured_query.display_fields:
             requested = [
                 f for f in result.structured_query.display_fields
                 if f in sample_row and f not in _INTERNAL_FIELDS
             ]
             if requested:
-                return self._pin_sn_first(requested, all_cols)[:MAX_FIELDS]
+                # Force SN at front even if parser didn't ask for it
+                if sn_col and sn_col not in requested:
+                    requested = [sn_col] + requested
+                return requested[:MAX_FIELDS]
 
-        # Fallback: natural column order
-        return self._pin_sn_first(all_cols, all_cols)[:MAX_FIELDS]
+        # ── Case 2: Fallback — natural column order with SN pinned ────────────
+        if sn_col:
+            ordered = [sn_col] + [c for c in all_cols if c != sn_col]
+            return ordered[:MAX_FIELDS]
 
-    @staticmethod
-    def _pin_sn_first(fields: list[str], all_cols: list[str]) -> list[str]:
-        """
-        Move 'SN' (or the first column of the sheet) to position 0
-        so users always have a reference number.
-        """
-        # Prefer explicit SN column
-        sn_candidates = [f for f in all_cols if f.strip().upper() in ("SN", "S.NO", "SR", "SR.NO", "ID")]
-        if sn_candidates:
-            sn = sn_candidates[0]
-            return [sn] + [f for f in fields if f != sn]
-
-        # No SN column — keep order as-is (first col acts as identifier)
-        return fields
+        return all_cols[:MAX_FIELDS]
 
     # ──────────────────────────────────────────────────────────────────────────
     # Single record line
@@ -200,15 +202,13 @@ class ResponseFormatter:
     ) -> str:
         """
         Produces a compact single line:
-          #3 · 15 · Urmila Gupta · Bal: ₹24.3L · Rcvd: 51.8%
+          *#1* · SN: 45 · Urmila Gupta · H-012 · Rcvd%: 51.8%
 
-        - idx      : display position (1-based)
-        - row      : the data dict
-        - fields   : ordered list of fields to render
+        SN is always shown with its label so the client can cross-reference the sheet.
         """
         parts: list[str] = [f"*#{idx}*"]
 
-        # Source tab provenance (multi-tab queries)
+        # Multi-tab provenance
         if "_source_tab" in row:
             parts.append(f"_[{row['_source_tab']}]_")
 
@@ -227,24 +227,29 @@ class ResponseFormatter:
     def _fmt_field_value(self, field: str, value) -> str:
         """
         Format one field-value pair as a compact token.
-        Auto-detects type from value and field name — no hardcoding.
 
         Examples:
-          SN=1          → "1"               (identifier, no label)
-          Name=...      → "Urmila Gupta"    (first meaningful field, no label)
-          Balance=6815846 → "Bal: ₹6.8L"
-          Received%=51.83 → "Rcvd%: 51.8%"
-          Tower=H       → "H"              (short categoricals, no label)
+          SN=45             → "SN: 45"            (always labelled — navigation anchor)
+          Name=Urmila Gupta → "Urmila Gupta"       (label dropped — value is self-evident)
+          Apt No.=H-012     → "H-012"              (short code, no label)
+          Balance=6815846   → "Bal: ₹68.2L"
+          Received%=51.83   → "Rcvd % age: 51.8%"
+          Tower=H           → "H"                  (single-char, no label)
         """
         field_lower = field.lower()
         label       = self._short_label(field)
+        is_sn       = field.strip().upper() in _SN_NAMES
 
         # ── Numeric formatting ────────────────────────────────────────────────
         try:
             fval = float(value)
 
+            # SN — always labelled so client knows this is the sheet row number
+            if is_sn:
+                return f"SN: {int(fval)}"
+
             # Percentage column
-            if "%" in field or any(w in field_lower for w in ("percent", "pct", "rate", "received")):
+            if "%" in field or any(w in field_lower for w in ("percent", "pct", "received")):
                 if 0.0 <= fval <= 1.0:
                     return f"{label}: {fval * 100:.1f}%"
                 return f"{label}: {fval:.1f}%"
@@ -252,16 +257,14 @@ class ResponseFormatter:
             # Currency column
             if any(w in field_lower for w in (
                 "price", "amount", "amt", "value", "balance", "bal",
-                "demanded", "paid", "sale", "basic rate",
+                "demanded", "paid", "sale",
             )):
                 return f"{label}: {self._fmt_inr(fval)}"
 
-            # Plain integer — if small, show as-is (SN, Phase, etc.)
+            # Small integer (phase, count, etc.)
             if fval == int(fval):
                 ival = int(fval)
-                if ival <= 9999:
-                    return str(ival) if label.upper() in ("SN", "SR", "ID") else f"{label}: {ival}"
-                return f"{label}: {ival:,}"
+                return f"{label}: {ival}" if ival <= 9999 else f"{label}: {ival:,}"
 
             return f"{label}: {fval:.2f}"
 
@@ -271,17 +274,19 @@ class ResponseFormatter:
         # ── String formatting ─────────────────────────────────────────────────
         str_val = str(value).strip()
 
-        # Very short values (Tower: H, Phase: 2) — skip label for readability
+        # Single-char or very short categoricals (Tower: H, Type: NEW) — no label
         if len(str_val) <= 4:
             return str_val
 
-        # Truncate long strings
+        # Name / address fields — primary human identifier, deserves more space
+        if any(w in field_lower for w in ("name", "address", "addr")):
+            if len(str_val) > MAX_NAME_LEN:
+                str_val = str_val[:MAX_NAME_LEN - 1] + "…"
+            return str_val   # label dropped — value is self-describing
+
+        # Generic string — truncate if too long
         if len(str_val) > MAX_VAL_LEN:
             str_val = str_val[:MAX_VAL_LEN - 1] + "…"
-
-        # Name-like fields — show value only, no label
-        if any(w in field_lower for w in ("name", "address", "addr")):
-            return str_val
 
         return f"{label}: {str_val}"
 
@@ -291,8 +296,8 @@ class ResponseFormatter:
 
     def _build_filter_summary(self, result: QueryResult) -> str:
         """
-        Produces a compact filter pill line:
-          Tower = H  |  Balance ≥ 500000  |  Type ∈ [NEW, OLD]
+        Compact filter pills at the bottom:
+          Phase = 1  |  Rcvd % age > 50  |  Type = NEW
         """
         if not result.structured_query or not result.structured_query.filters:
             return ""
@@ -304,11 +309,13 @@ class ResponseFormatter:
             val   = f.value
 
             if isinstance(val, list):
-                val_str = f"[{', '.join(str(v) for v in val[:3])}{'…' if len(val) > 3 else ''}]"
+                val_str = (
+                    f"[{', '.join(str(v) for v in val[:3])}"
+                    f"{'…' if len(val) > 3 else ''}]"
+                )
             else:
-                # Format numeric filter values
                 try:
-                    fv = float(val)
+                    fv      = float(val)
                     val_str = self._fmt_inr(fv) if fv >= 1000 else str(val)
                 except (TypeError, ValueError):
                     val_str = str(val)
@@ -324,30 +331,27 @@ class ResponseFormatter:
     @staticmethod
     def _short_label(field: str) -> str:
         """
-        Produce a compact display label from a column name.
-        Strips common noise words, truncates to MAX_LABEL_LEN.
+        Compact display label from a column name.
 
         Examples:
-          "Received Amt With Tax"             → "Rcvd Amt"
-          "Balance Amt"                       → "Bal Amt"
-          "Basic Sale Price"                  → "Sale Price"
-          "Total Sale Value with Tax..."      → "Total Sale…"
+          "Received Amt With Tax"                → "Rcvd Amt"
+          "Balance Amt"                          → "Bal Amt"
+          "Total Sale Value with Tax incl. IFMS" → "Total Sale…"
+          "Received % age"                       → "Rcvd % age"
         """
-        # Common substitutions for long words
-        substitutions = {
+        substitutions: dict[str, str] = {
             "received":  "Rcvd",
             "balance":   "Bal",
             "amount":    "Amt",
             "number":    "No",
             "payment":   "Pymnt",
             "original":  "Orig",
-            "total":     "Total",
             "with":      "",
             "including": "",
             "tax":       "",
             "and":       "",
         }
-        tokens = field.replace("\n", " ").split()
+        tokens       = field.replace("\n", " ").split()
         short_tokens = []
         for tok in tokens:
             replacement = substitutions.get(tok.lower())
@@ -355,7 +359,7 @@ class ResponseFormatter:
                 short_tokens.append(tok)
             elif replacement:
                 short_tokens.append(replacement)
-            # empty replacement → skip the word
+            # empty string replacement → word dropped
 
         label = " ".join(short_tokens).strip()
         if len(label) > MAX_LABEL_LEN:
@@ -366,14 +370,14 @@ class ResponseFormatter:
     def _fmt_inr(val: float) -> str:
         """
         Indian currency compact format:
-          6815846 → ₹68.2L
-          500000  → ₹5.0L
-          45000   → ₹45.0k
-          1500    → ₹1,500
+          6,815,846 → ₹68.2L
+          500,000   → ₹5.0L
+          45,000    → ₹45.0k
+          1,500     → ₹1,500
         """
-        if val >= 10_000_000:   # 1 Cr+
+        if val >= 10_000_000:
             return f"₹{val / 10_000_000:.1f}Cr"
-        if val >= 100_000:      # 1 L+
+        if val >= 100_000:
             return f"₹{val / 100_000:.1f}L"
         if val >= 1_000:
             return f"₹{val / 1_000:.1f}k"
