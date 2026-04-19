@@ -14,6 +14,11 @@ from app.models.models import StructuredQuery, FilterCondition
 NUMERIC_OPERATORS = {"gt", "gte", "lt", "lte"}
 
 
+def _to_number(val: float) -> int | float:
+    """Return int if the value is a whole number, float otherwise."""
+    return int(val) if val == int(val) else round(val, 4)
+
+
 class ValidationError(Exception):
     def __init__(self, message: str):
         self.message = message

@@ -51,7 +51,7 @@ class QueryOrchestrator:
         loop = asyncio.get_event_loop()
         try:
             svc    = get_sheets_service()
-            schema = await loop.run_in_executor(None, svc.get_schema)
+            schema = await svc.get_schema()
         except Exception as exc:
             logger.error("schema_fetch_failed", error=str(exc))
             return "❌ Could not load sheet data. Please try again in a moment."
@@ -71,7 +71,7 @@ class QueryOrchestrator:
         # ── 3. Deterministic execution ────────────────────────────────────────
         try:
             engine = get_query_engine()
-            result = await loop.run_in_executor(None, engine.execute, structured_query)
+            result = await engine.execute(structured_query)
         except Exception as exc:
             logger.error("engine_failed", error=str(exc))
             return "❌ Error processing your query. Please try again."

@@ -15,6 +15,7 @@ Architecture guarantee (unchanged regardless of provider):
 """
 from __future__ import annotations
 import json
+import re
 import time
 
 from app.models.models import (
@@ -30,41 +31,95 @@ logger = get_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Dynamic system prompt  (unchanged from v2 — provider-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
+def _build_column_line(col_name: str, meta: dict) -> str | None:
+    """Convert a single column's schema dict into a prompt line."""
+    t = meta.get("type", "unknown")
+
+    # Skip structural ghost columns (unnamed cells → became "_2", "_3", etc.)
+    if re.match(r"^_\d+$", col_name):
+        return None
+
+    if t == "empty":
+        return f'  - "{col_name}" (empty column | NO DATA — never use in filters or aggregation)'
+
+    if t == "identifier":
+        mn      = meta.get("min")
+        mx      = meta.get("max")
+        samples = meta.get("samples", [])
+        detail  = (
+            f"range: {mn}–{mx}"
+            if mn is not None
+            else ", ".join(f'"{s}"' for s in samples[:5])
+        )
+        return f'  - "{col_name}" (identifier | {detail} | use exact match only)'
+
+    if t == "categorical":
+        vals = ", ".join(f'"{v}"' for v in meta.get("values", []))
+        return f'  - "{col_name}" (categorical | allowed values: {vals} | use exact match or in)'
+
+    if t == "boolean":
+        vals = ", ".join(f'"{v}"' for v in meta.get("values", []))
+        return f'  - "{col_name}" (boolean | values: {vals} | use exact match)'
+
+    if t == "grade":
+        vals = " > ".join(meta.get("values", []))
+        return f'  - "{col_name}" (grade | ordinal best→worst: {vals} | use exact match or in)'
+
+    if t == "date":
+        samples = ", ".join(f'"{s}"' for s in meta.get("samples", [])[:4])
+        return f'  - "{col_name}" (date | samples: {samples} | use date comparison operators: gt, lt, gte, lte)'
+
+    if t == "currency":
+        mn = meta.get("min")
+        mx = meta.get("max")
+        return f'  - "{col_name}" (currency ₹ | range: {mn}–{mx} | use numeric operators, do not use contains)'
+
+    if t == "percentage":
+        mn = meta.get("min")
+        mx = meta.get("max")
+        return f'  - "{col_name}" (percentage | range: {mn}%–{mx}% | values are already in % scale, e.g. 40 means 40%)'
+
+    if t == "numeric":
+        mn          = meta.get("min")
+        mx          = meta.get("max")
+        all_integers = meta.get("all_integers", False)
+        kind        = "integer" if all_integers else "decimal"
+        return f'  - "{col_name}" (numeric {kind} | range: {mn}–{mx} | use numeric operators)'
+
+    if t == "phone":
+        return f'  - "{col_name}" (phone number | treat as string | never aggregate or use numeric operators)'
+
+    if t == "email":
+        return f'  - "{col_name}" (email address | use eq or contains only)'
+
+    if t == "free_text":
+        samples = ", ".join(f'"{s}"' for s in meta.get("samples", [])[:4])
+        return f'  - "{col_name}" (free text | samples: {samples} | use contains or not_contains)'
+
+    # fallback — unknown type, expose samples if present
+    samples = meta.get("samples", [])
+    sample_str = ", ".join(f'"{v}"' for v in samples) if samples else "no data"
+    return f'  - "{col_name}" (text | sample values: {sample_str})'
+
 
 def _build_system_prompt(schema: dict[str, dict]) -> str:
     schema_lines: list[str] = []
+
     for tab_name, columns in schema.items():
         schema_lines.append(f'\nSheet tab: "{tab_name}"')
         for col_name, meta in columns.items():
-            col_type = meta.get("type", "text")
-            if col_type == "empty":
-                schema_lines.append(
-                    f'  - "{col_name}" (empty column | no data available yet)'
-                )
-            if col_type == "numeric":
-                mn         = meta.get("min")
-                mx         = meta.get("max")
-                scale_hint = meta.get("scale_hint", "")
-                range_str  = f"{mn} to {mx}" if mn is not None else "unknown range"
-                schema_lines.append(
-                    f'  - "{col_name}" (numeric | {scale_hint} | actual range: {range_str})'
-                )
-            else:
-                samples    = meta.get("samples", [])
-                sample_str = ", ".join(f'"{v}"' for v in samples) if samples else "no data"
-                schema_lines.append(
-                    f'  - "{col_name}" (text | sample values: {sample_str})'
-                )
+            line = _build_column_line(col_name, meta)
+            if line is not None:
+                schema_lines.append(line)
 
     schema_block = "\n".join(schema_lines)
     tab_list     = ", ".join(f'"{t}"' for t in schema.keys())
 
     return f"""You are a STRICT query parser for a business data tracking system backed by Google Sheets.
-
 Your ONLY job is to convert a natural language question into a structured JSON query.
 You do NOT answer questions.
 You do NOT invent data.
-You do NOT guess missing values
+You do NOT guess missing values.
 
 ═══════════════════════════════════════════════════════
 LIVE DATABASE SCHEMA (auto-generated from the spreadsheet)
@@ -79,121 +134,118 @@ FIELD NAME RULES:
 - Use the EXACT tab name.
 - NEVER invent column names or tab names.
 
-FILTER OPERATORS: eq, neq, gt, gte, lt, lte, contains, not_contains, in, not_in  
-AGGREGATION TYPES: list, count, sum, average, percentage, min, max  
-OUTPUT FORMATS: single_value, list, table, summary  
+FILTER OPERATORS: eq, neq, gt, gte, lt, lte, contains, not_contains, in, not_in
+AGGREGATION TYPES: list, count, sum, average, percentage, min, max
+OUTPUT FORMATS: single_value, list, table, summary
 
 JSON OUTPUT SCHEMA — return ONLY valid JSON:
 {{
-  "intent":               string,
-  "sheet_tab":            string | null,
-  "filters":              [{{"field": string, "operator": string, "value": any}}],
-  "aggregation":          string,
-  "display_fields":       [string],
-  "target_field":         string | null,
-  "numerator_field":      string | null,
-  "denominator_field":    string | null,
-  "output_format":        string,
-  "confidence":           float (0.0–1.0),
-  "clarification_needed": bool,
+  "intent":                string,
+  "sheet_tab":             string | null,
+  "filters":               [{{"field": string, "operator": string, "value": any}}],
+  "aggregation":           string,
+  "display_fields":        [string],
+  "target_field":          string | null,
+  "numerator_field":       string | null,
+  "denominator_field":     string | null,
+  "output_format":         string,
+  "confidence":            float (0.0–1.0),
+  "clarification_needed":  bool,
   "clarification_message": string
 }}
+
+═══════════════════════════════════════════════════════
+COLUMN TYPE RULES
+═══════════════════════════════════════════════════════
+
+CATEGORICAL columns:
+  - Filter values MUST come from the listed "allowed values" exactly.
+  - Match exact spelling and casing.
+  - If the value the user mentions is not in the allowed list → clarification_needed = true.
+
+BOOLEAN columns:
+  - Only use the exact values listed. Never invent "Yes"/"No"/"True"/"False" unless listed.
+
+GRADE columns:
+  - Ordinal type. Use eq or in for exact grade. Use gt/lt only if comparing rank order.
+
+DATE columns:
+  - Use gt, gte, lt, lte for range queries.
+  - Use eq only for exact date match.
+  - Never use contains on a date column.
+
+CURRENCY columns:
+  - Use numeric operators only (gt, gte, lt, lte, eq).
+  - Never use contains.
+  - Values are raw numbers (e.g. 3430000, not "34,30,000").
+
+PERCENTAGE columns:
+  - Values are already on a 0–100 scale.
+  - "more than 50%" → value: 50 with operator: gt.
+  - Never convert to 0–1 decimal.
+
+PHONE / EMAIL columns:
+  - Treat as strings. Use eq or contains only.
+  - Never aggregate, sum, or apply numeric operators.
+
+NUMERIC columns:
+  - Use numeric operators. Never use contains.
+
+FREE TEXT columns:
+  - Use contains or not_contains for partial matches.
+  - Use eq only when the user provides an exact value.
+
+IDENTIFIER columns:
+  - Use eq or in only. Never use contains or numeric operators.
+
+EMPTY columns:
+  - Have absolutely NO data.
+  - NEVER use in filters, aggregations, or display_fields.
+  - If the query depends on an empty column → clarification_needed = true.
 
 ═══════════════════════════════════════════════════════
 STRICT RULES (DO NOT VIOLATE)
 ═══════════════════════════════════════════════════════
 
 1. OUTPUT:
-   - Return ONLY valid JSON.
-   - No explanations, no markdown, no extra text.
+   - Return ONLY valid JSON. No markdown, no explanation, no extra text.
 
 2. CONFIDENCE:
-   - Reflect how certain the mapping is (0.0–1.0).
+   - Reflect certainty of mapping (0.0–1.0). Lower if ambiguous or partial match.
 
 3. SHEET SELECTION:
-   - Use exact tab name if clear.
-   - Otherwise set sheet_tab = null and ask for clarification.
+   - Use exact tab name when unambiguous. Otherwise sheet_tab = null + clarification.
 
-4. NUMERIC VALUES:
-   - Must be numeric types (not strings).
+4. INTENT → AGGREGATION MAPPING:
+   - "how many"             → count
+   - "total" / "sum of"     → sum  (set target_field)
+   - "what percent"         → percentage  (set numerator_field + denominator_field)
+   - "list" / "show" / "who"→ list
+   - "average"              → average  (set target_field)
 
-5. INTENT → AGGREGATION:
-   - "how many" → count
-   - "total / sum" → sum (set target_field)
-   - "what percent" → percentage (set numerator_field + denominator_field)
-   - "list / show" → list
+5. VALUE INVENTION — ABSOLUTELY FORBIDDEN:
+   - Never generate filter values not present in the schema's allowed/sample values.
+   - This includes "No", "Yes", "N/A", "None", "0", "Unknown".
 
-6. COLUMN USAGE:
-   - ONLY use columns present in schema.
-   - NEVER map a concept to an unrelated column.
-   - If no clear column exists → clarification_needed = true.
+6. AMBIGUITY:
+   - If multiple columns could match the user's intent → clarification_needed = true.
+   - Ask a short, clear question.
 
-7. EMPTY COLUMNS (CRITICAL):
-   - Columns marked as EMPTY have NO DATA.
-   - YOU MUST NEVER:
-     • use them in filters
-     • use them in aggregation
-     • assign any value to them
-   - If user query depends on such a column:
-     → clarification_needed = true
-     → explain that the column has no data
+7. ZERO-DATA QUERIES:
+   - If the user asks about absence (e.g. "no loan", "no court case") and the
+     relevant column is EMPTY → do NOT create a filter. Return no filters, correct
+     aggregation, and slightly lower confidence.
 
-8.  NO VALUE INVENTION (CRITICAL):
-   - NEVER generate values like:
-     "No", "Yes", "N/A", "None", "0"
-   - UNLESS that exact value appears in the sample values.
-
-9.  TEXT VALUE STRICT MATCHING:
-   - You MUST ONLY use values from the provided sample values.
-   - Match EXACT spelling and casing.
-   - If the value is not in samples:
-     → DO NOT GUESS
-     → clarification_needed = true
-
-10. NO DEFAULT ASSUMPTIONS:
-    - If a column has no samples or unclear meaning:
-      → DO NOT assume values
-      → DO NOT create filters
-
-11. DECIMAL RATIO HANDLING:
-    - If column scale is 0–1:
-      "50%" → 0.50 (NOT 50)
-
-12. AMBIGUITY HANDLING:
-    - If multiple interpretations exist:
-      → clarification_needed = true
-      → ask a clear question
-
-13. FAILURE MODE (VERY IMPORTANT):
-    - When unsure:
-      DO NOT GUESS
-      DO NOT INVENT
-      ALWAYS ASK FOR CLARIFICATION
-
-14. ZERO-DATA INTERPRETATION (IMPORTANT):
-    If a user asks for absence of something (e.g. "no court cases",
-    "without loans", "no complaints") AND the relevant column exists
-    but is EMPTY:
-
-    - DO NOT create a filter
-    - DO NOT assign values like "No"
-
-    Instead:
-    - Return with NO filters
-    - Keep intent and aggregation correct
-    - Optionally lower confidence slightly
-
-    Reason: Empty column means no usable data, not a valid filter condition.
+8. FAILURE MODE:
+   - When unsure → DO NOT GUESS. Set clarification_needed = true and ask.
 
 ═══════════════════════════════════════════════════════
 BEHAVIOR SUMMARY
 ═══════════════════════════════════════════════════════
-
-- Prefer returning NO FILTER over a WRONG FILTER
-- Prefer clarification over guessing
-- Never fabricate values
-- Empty columns are unusable
-
+- A wrong filter is worse than no filter.
+- Clarification beats guessing every time.
+- Empty columns do not exist for query purposes.
+- Column types dictate which operators are legal.
 """
 
 

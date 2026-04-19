@@ -11,8 +11,10 @@ from googleapiclient.errors import HttpError
 from app.services.llm_client import get_llm_client
 from app.services.query_parser import _build_header_row_detection_prompt
 from app.utils.cache import get_parquet_cache, ParquetCache
+from app.utils.df_utils import _dedup_columns
 from app.utils.logger import get_logger
 from app.config import get_settings
+from app.utils.validators import _to_number
 
 logger = get_logger(__name__)
 
@@ -201,7 +203,7 @@ class SheetsService:
                 data    = raw[header_row + 1:]
 
                 df = pd.DataFrame(data, columns=headers)
-
+                df.columns = _dedup_columns(list(df.columns))
                 # Drop columns whose name is empty/whitespace
                 df = df.loc[:, df.columns.str.strip() != ""]
 
@@ -548,6 +550,7 @@ class SheetsService:
 
         return df
 
+
     def _infer_column_types(self, df: pd.DataFrame) -> dict[str, dict]:
         result = {}
 
@@ -555,62 +558,147 @@ class SheetsService:
             try:
                 col_series = df[col]
 
-                # ── 1. Empty column ───────────────────────────────────────────
-                try:
-                    is_empty = (
-                        col_series.isna().all() or
-                        col_series.astype(str).str.strip().eq("").all()
-                    )
-                except Exception as exc:
-                    logger.warning("empty_check_failed", col=col, error=str(exc))
-                    is_empty = False
+                # ── 0. Duplicate column names → df[col] returns DataFrame ─────────
+                if isinstance(col_series, pd.DataFrame):
+                    col_series = col_series.iloc[:, 0]
 
+                col_lower  = col.lower().strip()
+                col_tokens = set(col_lower.replace("-", " ").replace("_", " ").replace("\n", " ").split())
+
+                # ── 1. Empty ──────────────────────────────────────────────────────
+                is_empty = (
+                    col_series.isna().all() or
+                    col_series.astype(str).str.strip().eq("").all()
+                )
                 if is_empty:
-                    result[col] = {"type": "empty", "note": "column exists but has no data yet"}
+                    result[col] = {"type": "empty"}
                     continue
 
-                # ── 2. Numeric column ─────────────────────────────────────────
+                cleaned_str = col_series.dropna().astype(str).str.strip()
+                non_empty   = cleaned_str[cleaned_str != ""]
+
+                # ── 2. Name-based overrides — before dtype check ──────────────────
+                # Phone: name matches AND values look like digit strings
+                if col_tokens & {"mob", "phone", "mobile", "contact", "cell"}:
+                    digit_ratio = (
+                        non_empty.str.replace(r"[\s\-\+\(\)]", "", regex=True)
+                        .str.isnumeric().mean()
+                    )
+                    if digit_ratio >= 0.5:
+                        result[col] = {"type": "phone", "note": "treat as string, do not aggregate"}
+                        continue
+
+                # Email
+                if col_tokens & {"email", "mail"}:
+                    result[col] = {"type": "email", "note": "use equality or contains filter"}
+                    continue
+
+                # ── 3. Numeric dtype ──────────────────────────────────────────────
                 if pd.api.types.is_numeric_dtype(col_series):
-                    try:
-                        col_clean = col_series.dropna()
-                        if col_clean.empty:
-                            result[col] = {"type": "numeric", "min": None, "max": None, "scale_hint": ""}
-                            continue
+                    col_clean    = col_series.dropna()
+                    mn           = float(col_clean.min())
+                    mx           = float(col_clean.max())
+                    all_integers = bool((col_clean % 1 == 0).all())
+                    n_unique     = col_clean.nunique()
+                    mn_out       = int(mn) if mn == int(mn) else round(mn, 4)
+                    mx_out       = int(mx) if mx == int(mx) else round(mx, 4)
 
-                        mn = float(col_clean.min())
-                        mx = float(col_clean.max())
-                        all_integers = (col_clean % 1 == 0).all()
+                    # Small-range integers → categorical (e.g. Phase: 1,2)
+                    if all_integers and (mx - mn) <= 20 and n_unique <= 10:
+                        unique_vals = sorted(col_clean.astype(int).unique().tolist())
+                        result[col] = {"type": "categorical", "values": unique_vals, "note": "use exact match"}
+                        continue
 
-                        if 0.0 <= mn and mx <= 1.0 and not all_integers:
-                            scale_hint = "decimal ratio 0-1 (e.g. 0.75 = 75%)"
-                        elif 0.0 <= mn and mx <= 100.0:
-                            scale_hint = "percentage 0-100"
-                        else:
-                            scale_hint = f"range {mn} to {mx}"
+                    # Identifier
+                    if col_lower in ("sn", "sr", "s.no", "id", "no") or col_lower.endswith("_id"):
+                        result[col] = {"type": "identifier", "min": mn_out, "max": mx_out}
+                        continue
 
+                    # Percentage
+                    if "%" in col or col_tokens & {"percent", "pct", "percentage"}:
+                        result[col] = {"type": "percentage", "min": mn_out, "max": mx_out}
+                        continue
+
+                    # Currency — only when max is large enough to be a monetary value
+                    if mx >= 1000 and any(k in col_lower for k in (
+                        "price", "amount", "amt", "value", "rate",
+                        "balance", "bal", "demanded", "paid", "sale",
+                    )):
                         result[col] = {
-                            "type": "numeric",
-                            "min": round(mn, 4),
-                            "max": round(mx, 4),
-                            "scale_hint": scale_hint,
+                            "type": "currency",
+                            "min": mn_out,
+                            "max": mx_out,
+                            "note": "monetary value — do not treat as plain integer",
                         }
-                    except Exception as exc:
-                        logger.warning("numeric_inference_failed", col=col, error=str(exc))
-                        result[col] = {"type": "numeric", "min": None, "max": None, "scale_hint": ""}
+                        continue
 
-                # ── 3. Text column ────────────────────────────────────────────
-                else:
-                    try:
-                        cleaned = col_series.dropna().astype(str).str.strip()
-                        non_empty = cleaned[cleaned != ""]
-                        samples = non_empty.unique().tolist()[:10]
-                        result[col] = {"type": "text", "samples": samples}
-                    except Exception as exc:
-                        logger.warning("text_inference_failed", col=col, error=str(exc))
-                        result[col] = {"type": "text", "samples": []}
+                    result[col] = {
+                        "type": "numeric",
+                        "min": mn_out,
+                        "max": mx_out,
+                        "all_integers": all_integers,
+                    }
+                    continue
+
+                # ── 4. String columns ─────────────────────────────────────────────
+
+                # Date
+                sample_parsed = pd.to_datetime(
+                    non_empty.head(10), format="mixed", dayfirst=True, errors="coerce"
+                )
+                if sample_parsed.notna().sum() >= min(5, len(non_empty.head(10))):
+                    result[col] = {
+                        "type": "date",
+                        "samples": non_empty.unique().tolist()[:5],
+                        "note": "use date comparison operators when filtering",
+                    }
+                    continue
+
+                unique_vals  = non_empty.str.upper().unique().tolist()
+                n_unique     = len(unique_vals)
+                cardinality  = n_unique / max(len(non_empty), 1)
+
+                # Grade (A–E)
+                if set(unique_vals) <= {"A", "B", "C", "D", "E"} and n_unique >= 2:
+                    result[col] = {
+                        "type": "grade",
+                        "values": sorted(unique_vals),
+                        "note": "ordinal — A is best, E is worst",
+                    }
+                    continue
+
+                # Boolean
+                if set(v.lower() for v in unique_vals) <= {"yes", "no", "y", "n", "true", "false"}:
+                    result[col] = {"type": "boolean", "values": sorted(unique_vals)}
+                    continue
+
+                # Categorical
+                if n_unique <= 20 and cardinality <= 0.6:
+                    result[col] = {
+                        "type": "categorical",
+                        "values": sorted(unique_vals[:20]),
+                        "note": "use exact match or isin() when filtering",
+                    }
+                    continue
+
+                # Identifier-like text
+                if col_tokens & {"apt", "unit", "flat", "no.", "code", "ref"}:
+                    result[col] = {
+                        "type": "identifier",
+                        "samples": non_empty.unique().tolist()[:10],
+                        "note": "unique code — use exact match",
+                    }
+                    continue
+
+                # Free text
+                result[col] = {
+                    "type": "free_text",
+                    "samples": non_empty.unique().tolist()[:5],
+                    "note": "use contains/partial match when filtering",
+                }
 
             except Exception as exc:
-                logger.error("infer_column_types_unexpected_error", col=col, error=str(exc))
+                logger.error("infer_column_types_error", col=col, error=str(exc))
                 result[col] = {"type": "unknown", "error": str(exc)}
 
         return result

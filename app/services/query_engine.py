@@ -9,6 +9,11 @@ Key changes from v1:
   • If sheet_tab is None (ambiguous), searches ALL tabs and merges results.
   • Column names are the REAL sheet column names (no canonical remapping).
   • Numeric-type awareness uses the live schema from SheetsService.
+  • Date-aware comparison operators (gt/gte/lt/lte handle date columns).
+  • EQ/NEQ coerces value to numeric when column is numeric dtype.
+  • Multi-tab aggregation (sum/average/min/max) works correctly.
+  • scalar_value is always a raw number — formatting happens at response layer.
+  • Validation only runs against the resolved tab, not blindly first tab.
 
 AI DOES NOT TOUCH THIS FILE.  All logic is explicit, auditable Python.
 """
@@ -27,6 +32,14 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Map operator strings to DataFrame method names for numeric/date comparisons
+_OP_METHOD: dict[str, str] = {
+    "gt":  "__gt__",
+    "gte": "__ge__",
+    "lt":  "__lt__",
+    "lte": "__le__",
+}
+
 
 class QueryEngine:
     """
@@ -35,7 +48,7 @@ class QueryEngine:
     Pipeline:
       1. Load DataFrames + schema (from cache)
       2. Resolve which tab(s) to query
-      3. Validate StructuredQuery against schema
+      3. Validate StructuredQuery against resolved tab schema
       4. Apply filters  →  filtered_df
       5. Apply aggregation  →  QueryResult
     """
@@ -47,12 +60,12 @@ class QueryEngine:
     # Public entry point
     # ──────────────────────────────────────────────────────────────────────────
 
-    def execute(self, query: StructuredQuery) -> QueryResult:
+    async def execute(self, query: StructuredQuery) -> QueryResult:
         t0 = time.monotonic()
 
         # 1. Load all data + schema
-        all_dfs = self._sheets.get_all_dataframes()
-        schema  = self._sheets.get_schema()
+        all_dfs = await self._sheets.get_all_dataframes()
+        schema  = await self._sheets.get_schema()
 
         if not all_dfs:
             return QueryResult(
@@ -78,27 +91,28 @@ class QueryEngine:
             # Tab not specified — search all tabs
             tabs_to_query = all_dfs
 
-        # 3. Validate against schema of target tab(s)
-        # Use the first (or only) tab's columns for validation
-        first_tab  = next(iter(tabs_to_query))
-        tab_schema = schema.get(first_tab, {})
-        available_cols = list(tab_schema.keys())
-
-        try:
-            validate_query(query, available_cols, tab_schema)
-        except ValidationError as exc:
-            return QueryResult(
-                success=False,
-                error_message=exc.message,
-                structured_query=query,
-            )
+        # 3. Validate against schema
+        # When a specific tab is given, validate strictly against it.
+        # When searching all tabs, skip strict validation — _execute_across_tabs
+        # handles missing columns per-tab gracefully.
+        if query.sheet_tab:
+            tab_schema     = schema.get(query.sheet_tab, {})
+            available_cols = list(tab_schema.keys())
+            try:
+                validate_query(query, available_cols, tab_schema)
+            except ValidationError as exc:
+                return QueryResult(
+                    success=False,
+                    error_message=exc.message,
+                    structured_query=query,
+                )
 
         # 4. Apply filters + aggregation across target tabs
         try:
             if len(tabs_to_query) == 1:
                 tab_name, df = next(iter(tabs_to_query.items()))
-                filtered = self._apply_filters(df, query.filters)
-                result   = self._aggregate(filtered, query, tab_name)
+                filtered     = self._apply_filters(df, query.filters)
+                result       = self._aggregate(filtered, query, tab_name)
             else:
                 result = self._execute_across_tabs(tabs_to_query, query)
         except Exception as exc:
@@ -135,10 +149,11 @@ class QueryEngine:
         """
         Run the same query against every tab and union the results.
         A tab is skipped silently if it doesn't contain the filtered columns.
-        Adds a "_source_tab" column to each result row so the user knows
-        which sheet each record came from.
+        For scalar aggregations (sum/average/min/max), combines into a single
+        DataFrame and delegates to _aggregate.
+        Adds a "_source_tab" column to each result row.
         """
-        combined_rows: list[dict] = []
+        combined_frames: list[pd.DataFrame] = []
         total = 0
 
         for tab_name, df in tabs.items():
@@ -152,21 +167,25 @@ class QueryEngine:
                 continue
 
             filtered = self._apply_filters(df, query.filters)
-            total   += len(filtered)
-
-            if len(filtered) == 0:
+            if filtered.empty:
                 continue
 
-            # Add provenance column
-            filtered = filtered.copy()
-            filtered.insert(0, "_source_tab", tab_name)
+            total += len(filtered)
 
-            display = query.display_fields or list(df.columns)
-            # Always include _source_tab
-            show_cols = ["_source_tab"] + [c for c in display if c in filtered.columns]
-            combined_rows.extend(filtered[show_cols].to_dict(orient="records"))
+            tagged = filtered.copy()
+            tagged.insert(0, "_source_tab", tab_name)
+            combined_frames.append(tagged)
 
-        # For count queries: return total across all tabs
+        if not combined_frames:
+            return QueryResult(
+                success=True,
+                rows=[],
+                total_rows_matched=0,
+            )
+
+        combined_df = pd.concat(combined_frames, ignore_index=True)
+
+        # count — return scalar total
         if query.aggregation in (AggregationType.COUNT.value, "count"):
             return QueryResult(
                 success=True,
@@ -175,9 +194,24 @@ class QueryEngine:
                 total_rows_matched=total,
             )
 
+        # scalar aggregations — delegate to _aggregate on combined DataFrame
+        if query.aggregation in (
+            AggregationType.SUM.value,     "sum",
+            AggregationType.AVERAGE.value, "average",
+            AggregationType.MIN.value,     "min",
+            AggregationType.MAX.value,     "max",
+            AggregationType.PERCENTAGE.value, "percentage",
+        ):
+            return self._aggregate(combined_df, query, "all tabs")
+
+        # list / table — return rows with source tab column
+        display   = query.display_fields or [c for c in combined_df.columns if c != "_source_tab"]
+        show_cols = ["_source_tab"] + [c for c in display if c in combined_df.columns]
+        rows      = combined_df[show_cols].to_dict(orient="records")
+
         return QueryResult(
             success=True,
-            rows=combined_rows,
+            rows=rows,
             total_rows_matched=total,
         )
 
@@ -202,55 +236,95 @@ class QueryEngine:
 
             col = df[field]
 
-            if op == FilterOperator.EQ.value:
-                if pd.api.types.is_numeric_dtype(col):
-                    m = col == value
-                else:
-                    m = col.astype(str).str.strip().str.lower() == str(value).lower()
-
-            elif op == FilterOperator.NEQ.value:
-                if pd.api.types.is_numeric_dtype(col):
-                    m = col != value
-                else:
-                    m = col.astype(str).str.strip().str.lower() != str(value).lower()
-
-            elif op == FilterOperator.GT.value:
-                m = pd.to_numeric(col, errors="coerce") > float(value)
-
-            elif op == FilterOperator.GTE.value:
-                m = pd.to_numeric(col, errors="coerce") >= float(value)
-
-            elif op == FilterOperator.LT.value:
-                m = pd.to_numeric(col, errors="coerce") < float(value)
-
-            elif op == FilterOperator.LTE.value:
-                m = pd.to_numeric(col, errors="coerce") <= float(value)
-
-            elif op == FilterOperator.CONTAINS.value:
-                m = col.astype(str).str.lower().str.contains(
-                    str(value).lower(), regex=False, na=False
-                )
-
-            elif op == FilterOperator.NOT_CONTAINS.value:
-                m = ~col.astype(str).str.lower().str.contains(
-                    str(value).lower(), regex=False, na=False
-                )
-
-            elif op == FilterOperator.IN.value:
-                vals = [str(v).lower() for v in value] if isinstance(value, list) else [str(value).lower()]
-                m = col.astype(str).str.lower().isin(vals)
-
-            elif op == FilterOperator.NOT_IN.value:
-                vals = [str(v).lower() for v in value] if isinstance(value, list) else [str(value).lower()]
-                m = ~col.astype(str).str.lower().isin(vals)
-
-            else:
-                logger.warning("unknown_operator", op=op)
+            try:
+                m = self._apply_single_filter(col, op, value)
+            except Exception as exc:
+                logger.warning("filter_apply_failed", field=field, op=op, error=str(exc))
                 continue
 
             mask = mask & m.fillna(False)
 
         return df[mask].reset_index(drop=True)
+
+    def _apply_single_filter(
+        self,
+        col: pd.Series,
+        op: str,
+        value,
+    ) -> pd.Series:
+        """
+        Apply one filter condition to a Series.
+        Handles numeric, date, and string columns correctly.
+        """
+        is_numeric = pd.api.types.is_numeric_dtype(col)
+
+        # ── EQ ───────────────────────────────────────────────────────────────
+        if op == FilterOperator.EQ.value:
+            if is_numeric:
+                # Coerce the incoming value to numeric so "1" == 1
+                return col == pd.to_numeric(value, errors="coerce")
+            return col.astype(str).str.strip().str.lower() == str(value).strip().lower()
+
+        # ── NEQ ──────────────────────────────────────────────────────────────
+        elif op == FilterOperator.NEQ.value:
+            if is_numeric:
+                return col != pd.to_numeric(value, errors="coerce")
+            return col.astype(str).str.strip().str.lower() != str(value).strip().lower()
+
+        # ── Range operators: GT / GTE / LT / LTE ─────────────────────────────
+        elif op in _OP_METHOD:
+            method = _OP_METHOD[op]
+
+            # Try date comparison first
+            col_dt = pd.to_datetime(col, format="mixed", dayfirst=True, errors="coerce")
+            val_dt = pd.to_datetime(str(value), dayfirst=True, errors="coerce")
+
+            if col_dt.notna().mean() > 0.5 and pd.notna(val_dt):
+                return getattr(col_dt, method)(val_dt)
+
+            # Fallback: numeric comparison
+            col_num = pd.to_numeric(col, errors="coerce")
+            try:
+                val_num = float(value)
+            except (TypeError, ValueError):
+                logger.warning("range_filter_non_numeric_value", value=value, op=op)
+                return pd.Series([False] * len(col), index=col.index)
+
+            return getattr(col_num, method)(val_num)
+
+        # ── CONTAINS ─────────────────────────────────────────────────────────
+        elif op == FilterOperator.CONTAINS.value:
+            return col.astype(str).str.lower().str.contains(
+                str(value).lower(), regex=False, na=False
+            )
+
+        # ── NOT_CONTAINS ─────────────────────────────────────────────────────
+        elif op == FilterOperator.NOT_CONTAINS.value:
+            return ~col.astype(str).str.lower().str.contains(
+                str(value).lower(), regex=False, na=False
+            )
+
+        # ── IN ───────────────────────────────────────────────────────────────
+        elif op == FilterOperator.IN.value:
+            vals = (
+                [str(v).lower() for v in value]
+                if isinstance(value, list)
+                else [str(value).lower()]
+            )
+            return col.astype(str).str.lower().isin(vals)
+
+        # ── NOT_IN ───────────────────────────────────────────────────────────
+        elif op == FilterOperator.NOT_IN.value:
+            vals = (
+                [str(v).lower() for v in value]
+                if isinstance(value, list)
+                else [str(value).lower()]
+            )
+            return ~col.astype(str).str.lower().isin(vals)
+
+        else:
+            logger.warning("unknown_operator", op=op)
+            return pd.Series([True] * len(col), index=col.index)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Aggregation
@@ -265,6 +339,7 @@ class QueryEngine:
         agg = query.aggregation
         n   = len(df)
 
+        # ── COUNT ─────────────────────────────────────────────────────────────
         if agg in (AggregationType.COUNT.value, "count"):
             return QueryResult(
                 success=True,
@@ -273,50 +348,55 @@ class QueryEngine:
                 total_rows_matched=n,
             )
 
+        # ── SUM ───────────────────────────────────────────────────────────────
         elif agg in (AggregationType.SUM.value, "sum"):
             field = query.target_field
-            total = self._safe_sum(df, field)
+            total = self._safe_numeric(df, field, "sum")
             return QueryResult(
                 success=True,
-                scalar_value=self._fmt_number(total),
+                scalar_value=total,
                 scalar_label=f"Sum of '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
+        # ── AVERAGE ───────────────────────────────────────────────────────────
         elif agg in (AggregationType.AVERAGE.value, "average"):
             field = query.target_field
-            avg   = pd.to_numeric(df[field], errors="coerce").mean() if field and field in df.columns else 0
+            avg   = self._safe_numeric(df, field, "mean")
             return QueryResult(
                 success=True,
-                scalar_value=self._fmt_number(avg),
+                scalar_value=avg,
                 scalar_label=f"Average of '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
+        # ── MIN ───────────────────────────────────────────────────────────────
         elif agg in (AggregationType.MIN.value, "min"):
             field = query.target_field
-            val   = pd.to_numeric(df[field], errors="coerce").min() if field and field in df.columns else None
+            val   = self._safe_numeric(df, field, "min")
             return QueryResult(
                 success=True,
-                scalar_value=self._fmt_number(val),
+                scalar_value=val,
                 scalar_label=f"Minimum '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
+        # ── MAX ───────────────────────────────────────────────────────────────
         elif agg in (AggregationType.MAX.value, "max"):
             field = query.target_field
-            val   = pd.to_numeric(df[field], errors="coerce").max() if field and field in df.columns else None
+            val   = self._safe_numeric(df, field, "max")
             return QueryResult(
                 success=True,
-                scalar_value=self._fmt_number(val),
+                scalar_value=val,
                 scalar_label=f"Maximum '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
+        # ── PERCENTAGE ────────────────────────────────────────────────────────
         elif agg in (AggregationType.PERCENTAGE.value, "percentage"):
-            num_total = self._safe_sum(df, query.numerator_field)
-            den_total = self._safe_sum(df, query.denominator_field)
-            pct = round((num_total / den_total * 100) if den_total else 0, 2)
+            num_total = self._safe_numeric(df, query.numerator_field,   "sum")
+            den_total = self._safe_numeric(df, query.denominator_field, "sum")
+            pct = round((num_total / den_total * 100) if den_total else 0.0, 2)
             return QueryResult(
                 success=True,
                 scalar_value=pct,
@@ -327,10 +407,15 @@ class QueryEngine:
                 total_rows_matched=n,
             )
 
-        else:  # LIST / TABLE (default)
+        # ── LIST / TABLE (default) ────────────────────────────────────────────
+        else:
             display = query.display_fields or list(df.columns)
             display = [c for c in display if c in df.columns]
-            rows    = df[display].to_dict(orient="records") if display else df.to_dict(orient="records")
+            rows    = (
+                df[display].to_dict(orient="records")
+                if display
+                else df.to_dict(orient="records")
+            )
             return QueryResult(
                 success=True,
                 rows=rows,
@@ -342,13 +427,30 @@ class QueryEngine:
     # ──────────────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _safe_sum(df: pd.DataFrame, field: str | None) -> float:
+    def _safe_numeric(
+        df: pd.DataFrame,
+        field: str | None,
+        operation: str,  # "sum" | "mean" | "min" | "max"
+    ) -> float:
+        """
+        Safely apply a numeric aggregation to a column.
+        Returns 0.0 if field is missing or non-numeric.
+        scalar_value is always a raw float — format at the response layer.
+        """
         if not field or field not in df.columns:
             return 0.0
-        return float(pd.to_numeric(df[field], errors="coerce").sum())
+        series = pd.to_numeric(df[field], errors="coerce")
+        if series.isna().all():
+            return 0.0
+        result = getattr(series, operation)()
+        return float(result) if not math.isnan(result) else 0.0
 
     @staticmethod
-    def _fmt_number(value) -> str:
+    def format_scalar(value: float | int | None) -> str:
+        """
+        Human-readable formatting for scalar values.
+        Call this at the response/display layer, NOT inside _aggregate.
+        """
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return "N/A"
         if isinstance(value, float) and value == int(value):
