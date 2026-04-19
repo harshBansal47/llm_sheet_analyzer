@@ -2,7 +2,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import threading
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
@@ -72,9 +71,6 @@ class SheetsService:
 
     async def get_all_dataframes(self, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
         t0 = time.monotonic()
-
-        # ── 1. Get current modifiedTime from Drive API ────────────────────────
-        # _get_sheet_modified_time is sync (blocking HTTP) — run in thread pool
         try:
             current_modified = await asyncio.to_thread(self._get_sheet_modified_time)
         except CredentialsError:
@@ -141,18 +137,20 @@ class SheetsService:
                     logger.warning("concurrent_fetch_cache_check_failed", error=str(exc))
 
             # _fetch_all_tabs is sync (blocking gspread calls) — run in thread pool
+            # Returns dict[str, list[list[str]]] — raw rows, no DataFrame yet
             try:
-                all_dfs = self._fetch_all_tabs()
+                all_raw = await asyncio.to_thread(self._fetch_all_tabs)
             except SheetFetchError:
                 raise
             except Exception as exc:
                 raise SheetFetchError(f"Unexpected error fetching tabs: {exc}") from exc
 
-            if not all_dfs:
+            if not all_raw:
                 raise SheetFetchError("No tabs were fetched — spreadsheet may be empty or inaccessible.")
 
-            # _normalize_all_dfs is async — calls AI for header detection
-            all_dfs = await self._normalize_all_dfs(all_dfs)
+            
+           
+            all_dfs = await self._normalize_all_dfs(all_raw)
 
             try:
                 schema = {tab: self._infer_column_types(df) for tab, df in all_dfs.items()}
@@ -182,51 +180,79 @@ class SheetsService:
     # Normalization
     # ──────────────────────────────────────────────────────────────────────────
 
-    async def _normalize_all_dfs(self, all_dfs: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-        cleaned = {}
-        for tab, df in all_dfs.items():
+    async def _normalize_all_dfs(
+        self, all_raw: dict[str, list[list[str]]]
+    ) -> dict[str, pd.DataFrame]:
+        """
+        For each tab's raw rows (list[list[str]]):
+          1. Detect the header row index directly on raw rows — no DataFrame needed.
+          2. Build the DataFrame once, correctly, using the detected header.
+          3. Coerce column types.
+        """
+        cleaned: dict[str, pd.DataFrame] = {}
+
+        for tab, raw in all_raw.items():
             try:
-                header_row = await self._detect_header_row(df)
-                new_df = self._apply_header(df, header_row)
-                new_df = self._coerce_types(new_df)
-                cleaned[tab] = new_df
+                preview      = raw[:6]
+                header_row   = await self._detect_header_row_from_raw(preview)
+
+                # Build DataFrame in one shot — header promoted, data sliced cleanly
+                headers = [c.strip() for c in raw[header_row]]
+                data    = raw[header_row + 1:]
+
+                df = pd.DataFrame(data, columns=headers)
+
+                # Drop columns whose name is empty/whitespace
+                df = df.loc[:, df.columns.str.strip() != ""]
+
+                df = self._coerce_types(df)
+                cleaned[tab] = df
+
                 logger.info(
                     "tab_normalized",
                     tab=tab,
                     header_row=header_row,
-                    rows=len(new_df),
-                    cols=list(new_df.columns),
+                    rows=len(df),
+                    cols=list(df.columns),
                 )
+
             except Exception as exc:
                 logger.warning("df_normalization_failed", tab=tab, error=str(exc))
-                cleaned[tab] = df  # fallback: return raw df untouched
+                # Fallback: treat row 0 as header, rest as data
+                try:
+                    fallback_df = pd.DataFrame(raw[1:], columns=raw[0])
+                    cleaned[tab] = fallback_df
+                except Exception as fallback_exc:
+                    logger.error(
+                        "df_normalization_fallback_failed",
+                        tab=tab,
+                        error=str(fallback_exc),
+                    )
+
         return cleaned
 
-    async def _detect_header_row(self, df: pd.DataFrame) -> int:
+    async def _detect_header_row_from_raw(self, preview: list[list[str]]) -> int:
         """
         Use the configured LLM to detect which row (0-based) is the header row.
-        Falls back to row 0 if AI call fails or returns an invalid index.
+        Receives raw rows (list[list[str]]) directly — no DataFrame conversion needed.
+        Falls back to row 0 if the AI call fails or returns an invalid index.
         """
-        LOOK_AT_ROWS = min(6, len(df))
+        LOOK_AT_ROWS = len(preview)  # preview is already sliced to min(6, total)
 
+        # Strip whitespace on each cell — mirrors what the old .astype(str).str.strip() did
         rows_preview = [
-            df.iloc[i].astype(str).str.strip().tolist()
-            for i in range(LOOK_AT_ROWS)
+            [cell.strip() for cell in row]
+            for row in preview
         ]
 
         system_prompt = _build_header_row_detection_prompt(rows_preview)
-
-        rows_block = "\n".join(
-            f"  Row {i}: {row}"
-            for i, row in enumerate(rows_preview)
-        )
-        user_prompt = (
-            f"Identify which row is the header row containing column names.\n\n"
-            f"Return ONLY valid JSON with keys: header_row_index, confidence, reason."
+        user_prompt   = (
+            "Identify which row is the header row containing column names.\n\n"
+            "Return ONLY valid JSON with keys: header_row_index, confidence, reason."
         )
 
         try:
-            client = get_llm_client()
+            client   = get_llm_client()
             raw_json = await client.complete(system_prompt, user_prompt)
 
             # Strip markdown fences — some providers add them despite instructions
@@ -268,8 +294,6 @@ class SheetsService:
         """Async wrapper — kept for call-site compatibility."""
         try:
             return await self.get_all_dataframes(force_refresh=force_refresh)
-        except SheetsServiceError:
-            raise
         except Exception as exc:
             raise SheetFetchError(f"sync_dataframe failed: {exc}") from exc
 
@@ -395,12 +419,12 @@ class SheetsService:
 
         return self._gspread
 
-    def _fetch_all_tabs(self) -> dict[str, pd.DataFrame]:
+    def _fetch_all_tabs(self) -> dict[str, list[list[str]]]:
         """
         Sync — called via asyncio.to_thread() from get_all_dataframes.
-        Fetches raw data from all worksheets using get_all_values() so that
-        NO row is pre-consumed as a header. _normalize_all_dfs() handles
-        header detection and promotion separately.
+        Returns raw rows as dict[str, list[list[str]]] — NO DataFrame is built here.
+        Header detection and DataFrame construction happen in _normalize_all_dfs(),
+        so no row is pre-consumed or misidentified as a header at this stage.
         """
         t0 = time.monotonic()
 
@@ -432,7 +456,7 @@ class SheetsService:
         if not worksheets:
             raise SheetFetchError("Spreadsheet has no worksheets.")
 
-        result: dict[str, pd.DataFrame] = {}
+        result: dict[str, list[list[str]]] = {}
 
         for worksheet in worksheets:
             tab = worksheet.title
@@ -450,15 +474,20 @@ class SheetsService:
                 continue
 
             try:
-                df = pd.DataFrame(raw)
-                df = df[df.apply(lambda r: r.str.strip().ne("").any(), axis=1)].reset_index(drop=True)
+                # Drop fully-empty rows (all cells are blank/whitespace)
+                raw = [row for row in raw if any(cell.strip() for cell in row)]
 
-                if df.empty:
+                if not raw:
                     logger.warning("tab_empty_after_clean", tab=tab)
                     continue
 
-                result[tab] = df
-                logger.info("tab_fetched_raw", tab=tab, rows=len(df), cols=df.shape[1])
+                result[tab] = raw
+                logger.info(
+                    "tab_fetched_raw",
+                    tab=tab,
+                    rows=len(raw),
+                    cols=len(raw[0]) if raw else 0,
+                )
 
             except Exception as exc:
                 logger.error("tab_processing_error", tab=tab, error=str(exc))
@@ -475,15 +504,6 @@ class SheetsService:
     # ──────────────────────────────────────────────────────────────────────────
     # Type coercion & schema inference  (sync — pure pandas, no I/O)
     # ──────────────────────────────────────────────────────────────────────────
-
-    def _apply_header(self, df: pd.DataFrame, header_row: int) -> pd.DataFrame:
-        """Promote the detected header row to column names and drop it from data."""
-        new_df = df.iloc[header_row:].reset_index(drop=True)
-        new_df.columns = new_df.iloc[0].astype(str).str.strip()
-        new_df = new_df[1:].reset_index(drop=True)
-        # Drop columns with empty names
-        new_df = new_df.loc[:, new_df.columns.str.strip().ne("")]
-        return new_df
 
     def _coerce_types(self, df: pd.DataFrame) -> pd.DataFrame:
         try:
