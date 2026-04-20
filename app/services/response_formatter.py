@@ -129,14 +129,8 @@ class ResponseFormatter:
 
         display_fields = self._resolve_display_fields(rows[0], result)
 
-        for i, row in enumerate(rows[:MAX_ROWS], 1):
+        for i, row in enumerate(rows, 1):
             lines.append(self._format_record_line(i, row, display_fields))
-
-        if n > MAX_ROWS:
-            remaining = n - MAX_ROWS
-            lines.append(
-                f"\n_...and {remaining} more record{'s' if remaining != 1 else ''}_"
-            )
 
         filter_line = self._build_filter_summary(result)
         if filter_line:
