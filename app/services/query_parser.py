@@ -28,9 +28,6 @@ from app.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dynamic system prompt  (unchanged from v2 — provider-agnostic)
-# ─────────────────────────────────────────────────────────────────────────────
 def _build_column_line(col_name: str, meta: dict) -> str | None:
     """Convert a single column's schema dict into a prompt line."""
     t = meta.get("type", "unknown")
@@ -51,7 +48,7 @@ def _build_column_line(col_name: str, meta: dict) -> str | None:
             if mn is not None
             else ", ".join(f'"{s}"' for s in samples[:5])
         )
-        return f'  - "{col_name}" (identifier | {detail} | use exact match only)'
+        return f'  - "{col_name}" (identifier | {detail} | use eq or in only | ALWAYS trust user-provided values, never validate existence)'
 
     if t == "categorical":
         vals = ", ".join(f'"{v}"' for v in meta.get("values", []))
@@ -80,10 +77,10 @@ def _build_column_line(col_name: str, meta: dict) -> str | None:
         return f'  - "{col_name}" (percentage | range: {mn}%–{mx}% | values are already in % scale, e.g. 40 means 40%)'
 
     if t == "numeric":
-        mn          = meta.get("min")
-        mx          = meta.get("max")
+        mn           = meta.get("min")
+        mx           = meta.get("max")
         all_integers = meta.get("all_integers", False)
-        kind        = "integer" if all_integers else "decimal"
+        kind         = "integer" if all_integers else "decimal"
         return f'  - "{col_name}" (numeric {kind} | range: {mn}–{mx} | use numeric operators)'
 
     if t == "phone":
@@ -94,10 +91,10 @@ def _build_column_line(col_name: str, meta: dict) -> str | None:
 
     if t == "free_text":
         samples = ", ".join(f'"{s}"' for s in meta.get("samples", [])[:4])
-        return f'  - "{col_name}" (free text | samples: {samples} | use contains or not_contains)'
+        return f'  - "{col_name}" (free text | samples: {samples} | use contains or not_contains | never ask user to confirm exact spelling)'
 
     # fallback — unknown type, expose samples if present
-    samples = meta.get("samples", [])
+    samples    = meta.get("samples", [])
     sample_str = ", ".join(f'"{v}"' for v in samples) if samples else "no data"
     return f'  - "{col_name}" (text | sample values: {sample_str})'
 
@@ -197,11 +194,46 @@ FREE TEXT columns:
 
 IDENTIFIER columns:
   - Use eq or in only. Never use contains or numeric operators.
+  - ALWAYS trust any identifier value the user provides (Apt No., SN, ID, etc.).
+  - NEVER tell the user an identifier "does not exist" — build the query and let the engine handle it.
 
 EMPTY columns:
   - Have absolutely NO data.
   - NEVER use in filters, aggregations, or display_fields.
   - If the query depends on an empty column → clarification_needed = true.
+
+═══════════════════════════════════════════════════════
+NAME & FREE TEXT MATCHING
+═══════════════════════════════════════════════════════
+
+- ALWAYS use "contains" operator for name-based searches. NEVER ask the user for exact spelling.
+- Treat names as case-insensitive partial matches — the execution engine handles case folding.
+- If a name query could match multiple records, set aggregation to "list" and let the engine return all matches.
+- For numeric fields on multiple matched records (e.g. "sum received for Vaibhav"), set aggregation to "sum".
+- NEVER say "Name matching is case-sensitive" or ask the user to confirm spelling.
+
+═══════════════════════════════════════════════════════
+NO MEMORY — STATELESS OPERATION
+═══════════════════════════════════════════════════════
+
+- You have NO memory of previous messages. Every query is fully independent.
+- If the query contains pronouns (his, her, their, its, the same, above) with NO
+  name, ID, or Apt No. present in the CURRENT message:
+    → clarification_needed = true
+    → clarification_message MUST say exactly:
+      "I don't have memory of previous messages. Please include the name or
+       apartment number in this message. Example: '[Name/Apt No.] cost and received'"
+- NEVER reference or assume context from a prior turn.
+
+═══════════════════════════════════════════════════════
+VALUE EXISTENCE VALIDATION — STRICTLY FORBIDDEN
+═══════════════════════════════════════════════════════
+
+- You do NOT have access to row-level data — only the schema (column names and types).
+- NEVER tell the user that a value "does not exist", "is not in the database",
+  or "could not be found". That is the execution engine's job, not yours.
+- Always build the query with whatever value the user provides.
+- This applies to ALL column types: identifiers, names, apartment numbers, SNs, etc.
 
 ═══════════════════════════════════════════════════════
 STRICT RULES (DO NOT VIOLATE)
@@ -246,6 +278,9 @@ BEHAVIOR SUMMARY
 - Clarification beats guessing every time.
 - Empty columns do not exist for query purposes.
 - Column types dictate which operators are legal.
+- You build queries. You never validate data existence.
+- You have no memory. Every message stands alone.
+- Names are always partial contains matches. Never ask for exact spelling.
 """
 
 

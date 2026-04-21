@@ -245,8 +245,8 @@ class ResponseFormatter:
             # Percentage column
             if "%" in field or any(w in field_lower for w in ("percent", "pct", "received")):
                 if 0.0 <= fval <= 1.0:
-                    return f"{label}: {fval * 100:.1f}%"
-                return f"{label}: {fval:.1f}%"
+                    return f"{label}: {fval:.1f}%"
+                return f"{label}: {fval:.1f}"
 
             # Currency column
             if any(w in field_lower for w in (

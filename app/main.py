@@ -20,12 +20,11 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger = get_logger("startup")
     settings = get_settings()
- 
-    # Pre-warm sheet cache
+
     logger.info("warming_sheet_cache")
     try:
         svc = get_sheets_service()
-        await svc.sync_dataframe(force_refresh=True)
+        await svc.sync_dataframe(force_refresh=False)
         logger.info("sheet_cache_warmed")
     except asyncio.TimeoutError:
         logger.warning("sheet_warm_timeout")
