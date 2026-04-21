@@ -62,6 +62,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_api_route("/", lambda: {"status": "ok"}, methods=["GET"], tags=["Default route"])
+
 settings = get_settings()
 cors_origins = ["*"] if settings.is_dev else []
 

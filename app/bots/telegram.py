@@ -1,21 +1,39 @@
 from __future__ import annotations
 import asyncio
-
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
-
 from app.models.models import IncomingMessage
 from app.services.query_orchestrator import get_orchestrator
 from app.utils.logger import get_logger
 from app.config import get_settings
 
 logger = get_logger(__name__)
+MAX_TG_MESSAGE_LENGTH = 4096
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Message Handler
 # ─────────────────────────────────────────────────────────────────────────────
+
+def split_message(text: str, max_length: int = MAX_TG_MESSAGE_LENGTH) -> list[str]:
+    """Split a long message into chunks that fit Telegram's limit."""
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    while text:
+        if len(text) <= max_length:
+            chunks.append(text)
+            break
+
+        split_at = text.rfind("\n", 0, max_length)
+        if split_at == -1:
+            split_at = max_length
+
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all incoming text messages safely."""
@@ -72,10 +90,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # ── Send response ────────────────────────────────────────────────
         try:
-            await update.message.reply_text(
-                text=response,
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            chunks = split_message(response)
+            for chunk in chunks:
+                await update.message.reply_text(
+                    text=chunk,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
         except Exception as exc:
             logger.error("telegram_send_failed", error=str(exc))
 
