@@ -281,6 +281,40 @@ BEHAVIOR SUMMARY
 - You build queries. You never validate data existence.
 - You have no memory. Every message stands alone.
 - Names are always partial contains matches. Never ask for exact spelling.
+
+═══════════════════════════════════════════════════════
+    ALIAS RESOLUTION RULES
+═══════════════════════════════════════════════════════
+ 
+    The user may send shorthand phrases.  Map them to real columns:
+ 
+    "total cost" / "sale value" / "sale price"
+        → Look for a column containing both "sale" and "value" or "price"
+ 
+    "received amount" / "amount received" / "total received"
+        → Look for a column containing "received" and ("amt" or "amount" or "with tax")
+ 
+    "balance" / "outstanding" / "pending amount"
+        → Look for a column containing "balance" or "bal"
+ 
+    "% received" / "recovery %" / "rcvd %"
+        → Look for a column containing "%" and "received" or "rcvd"
+ 
+    "group name" / "builder" / "developer"
+        → Look for a column named "Group Name" or similar
+ 
+    When [PREPROCESSOR NOTES] appear in the user prompt, use them as
+    additional resolution context.  They do not change the filter logic —
+    they only help identify the correct column name.
+ 
+    MULTI-FIELD QUERIES  (e.g. "total cost and received amount")
+    If the user asks for two numeric fields in one query:
+      - Set aggregation = "list"
+      - Set display_fields = [<field1>, <field2>]
+      - Do NOT use aggregation = "sum" for multi-field queries.
+      - The user can ask for individual sums separately.
+ 
+    ═══════════════════════════════════════════════════════
 """
 
 
@@ -353,15 +387,20 @@ class QueryParser:
         self,
         question: str,
         schema: dict[str, dict[str, str]],
+        hints: list[str] | None = None,         # <-- NEW parameter
     ) -> StructuredQuery:
-        """
-        Convert a natural language question into a StructuredQuery.
-        Uses whichever LLM provider is configured — transparent to callers.
-        """
         t0            = time.monotonic()
         system_prompt = _build_system_prompt(schema)
-        user_prompt   = f"Parse this query into JSON: {question}"
-
+ 
+        # Append preprocessor hints to the user prompt (NOT system prompt)
+        # so the LLM can use them without them contaminating the schema block.
+        hint_block = ""
+        if hints:
+            hint_block = "\n\n[PREPROCESSOR NOTES — use these to resolve ambiguity]\n"
+            hint_block += "\n".join(hints)
+ 
+        user_prompt = f"Parse this query into JSON: {question}{hint_block}"
+ 
         client = get_llm_client()
         try:
             raw_json = await client.complete(system_prompt, user_prompt)
@@ -375,9 +414,8 @@ class QueryParser:
         except Exception as exc:
             logger.error("llm_error", provider=client.provider_name, error=str(exc))
             raise ValueError(f"LLM call failed ({client.provider_name}): {exc}") from exc
-
+ 
         return self._build_query(raw_json, question, schema)
-
     # ──────────────────────────────────────────────────────────────────────────
 
     def _build_query(

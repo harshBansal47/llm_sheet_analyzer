@@ -27,6 +27,7 @@ from app.models.models import (
     AggregationType, OutputFormat
 )
 from app.services.sheets_service import get_sheets_service
+from app.services.text_processor import fuzzy_match_value
 from app.utils.validators import validate_query, ValidationError
 from app.utils.logger import get_logger
 
@@ -261,9 +262,26 @@ class QueryEngine:
         # ── EQ ───────────────────────────────────────────────────────────────
         if op == FilterOperator.EQ.value:
             if is_numeric:
-                # Coerce the incoming value to numeric so "1" == 1
                 return col == pd.to_numeric(value, errors="coerce")
-            return col.astype(str).str.strip().str.lower() == str(value).strip().lower()
+ 
+            # Case-insensitive exact match first
+            str_val = str(value).strip().lower()
+            base_mask = col.astype(str).str.strip().str.lower() == str_val
+            if base_mask.any():
+                return base_mask
+ 
+            # Fuzzy fallback — try to find the closest value in unique values
+            unique_vals = col.dropna().astype(str).unique().tolist()
+            best_match  = fuzzy_match_value(str(value), unique_vals, cutoff=0.75)
+            if best_match:
+                logger.info(
+                    "fuzzy_eq_match",
+                    user_value=value,
+                    matched=best_match,
+                    col=col.name,
+                )
+                return col.astype(str).str.strip() == best_match
+            return base_mask  # return empty mask — no match
 
         # ── NEQ ──────────────────────────────────────────────────────────────
         elif op == FilterOperator.NEQ.value:
@@ -294,9 +312,26 @@ class QueryEngine:
 
         # ── CONTAINS ─────────────────────────────────────────────────────────
         elif op == FilterOperator.CONTAINS.value:
-            return col.astype(str).str.lower().str.contains(
-                str(value).lower(), regex=False, na=False
+            str_val = str(value).strip()
+            mask    = col.astype(str).str.lower().str.contains(
+                str_val.lower(), regex=False, na=False
             )
+            # If nothing matched, try a fuzzy prefix search (handles typos)
+            if not mask.any() and len(str_val) >= 3:
+                unique_vals = col.dropna().astype(str).unique().tolist()
+                best_match  = fuzzy_match_value(str_val, unique_vals, cutoff=0.70)
+                if best_match:
+                    logger.info(
+                        "fuzzy_contains_match",
+                        user_value=str_val,
+                        matched=best_match,
+                        col=col.name,
+                    )
+                    # Use the matched value as a new contains seed
+                    mask = col.astype(str).str.lower().str.contains(
+                        best_match.lower(), regex=False, na=False
+                    )
+            return mask
 
         # ── NOT_CONTAINS ─────────────────────────────────────────────────────
         elif op == FilterOperator.NOT_CONTAINS.value:
@@ -314,13 +349,28 @@ class QueryEngine:
             return col.astype(str).str.lower().isin(vals)
 
         # ── NOT_IN ───────────────────────────────────────────────────────────
-        elif op == FilterOperator.NOT_IN.value:
-            vals = (
-                [str(v).lower() for v in value]
-                if isinstance(value, list)
-                else [str(value).lower()]
-            )
-            return ~col.astype(str).str.lower().isin(vals)
+        elif op == FilterOperator.IN.value:
+            raw_vals = value if isinstance(value, list) else [value]
+            unique_col_vals = col.dropna().astype(str).unique().tolist()
+ 
+            resolved: list[str] = []
+            for v in raw_vals:
+                str_v = str(v).strip()
+                # Direct case-insensitive check
+                direct = [c for c in unique_col_vals if c.lower() == str_v.lower()]
+                if direct:
+                    resolved.extend(direct)
+                else:
+                    # Fuzzy resolve
+                    best = fuzzy_match_value(str_v, unique_col_vals, cutoff=0.75)
+                    if best:
+                        logger.info("fuzzy_in_match", user_value=str_v, matched=best, col=col.name)
+                        resolved.append(best)
+                    else:
+                        resolved.append(str_v)  # keep original — let it produce empty match
+ 
+            resolved_lower = [r.lower() for r in resolved]
+            return col.astype(str).str.lower().isin(resolved_lower)
 
         else:
             logger.warning("unknown_operator", op=op)

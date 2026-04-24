@@ -242,17 +242,30 @@ class ResponseFormatter:
             if is_sn:
                 return f"SN: {int(fval)}"
 
-            # Percentage column
-            if "%" in field or any(w in field_lower for w in ("percent", "pct", "received")):
+            # Percentage column — only match if "%" explicitly in column name
+            # or column name contains percent/pct WITHOUT "amt"/"amount"
+            is_pct_col = (
+                "%" in field
+                or (
+                    any(w in field_lower for w in ("percent", "pct"))
+                    and not any(w in field_lower for w in ("amt", "amount", "value"))
+                )
+            )
+            if is_pct_col:
                 if 0.0 <= fval <= 1.0:
-                    return f"{label}: {fval:.1f}%"
-                return f"{label}: {fval:.1f}"
-
-            # Currency column
-            if any(w in field_lower for w in (
+                    return f"{label}: {fval * 100:.1f}%"
+                return f"{label}: {fval:.1f}%"
+ 
+            # Currency column — includes "received", "demanded", "paid", etc.
+            is_currency = any(w in field_lower for w in (
                 "price", "amount", "amt", "value", "balance", "bal",
-                "demanded", "paid", "sale",
-            )):
+                "demanded", "paid", "sale", "received", "rcvd",
+            ))
+            if is_currency:
+                return f"{label}: {self._fmt_inr(fval)}"
+ 
+            # Auto-detect: large bare number → treat as currency
+            if fval >= 10_000:
                 return f"{label}: {self._fmt_inr(fval)}"
 
             # Small integer (phase, count, etc.)
