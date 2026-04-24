@@ -52,7 +52,7 @@ Your ONLY job: take any messy user message and rewrite it as one clean,
 unambiguous English sentence that a strict JSON query parser can understand.
 
 ════════════════════════════════════════════
-LIVE DATABASE SCHEMA
+LIVE GOOGLE SHEET SCHEMA
 ════════════════════════════════════════════
 {schema_block}
 ════════════════════════════════════════════

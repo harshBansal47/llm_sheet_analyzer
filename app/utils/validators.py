@@ -1,6 +1,7 @@
 """
 utils/validators.py  –  Pre-execution validation of StructuredQuery.
 """
+from difflib import get_close_matches
 from app.models.models import StructuredQuery, FilterCondition
 
 # Operators that require the column to hold comparable (ordered) values
@@ -93,11 +94,17 @@ def validate_query(
     # ── 5. Aggregation validation ─────────────────────────────────────────────
     agg = query.aggregation if isinstance(query.aggregation, str) else query.aggregation.value
 
-    if agg in ("sum", "average", "min", "max") and not query.target_field:
-        raise ValidationError(
-            f"Aggregation '{agg}' requires a target column. "
-            "Please specify which column to compute."
-        )
+    if agg in ("sum", "average", "min", "max"):
+        has_target   = bool(query.target_field)
+        # Multi-field sum: parser puts both columns in display_fields instead
+        # of picking one as target_field.  This is valid — the engine handles it.
+        has_display  = bool(query.display_fields)
+
+        if not has_target and not has_display:
+            raise ValidationError(
+                f"Aggregation '{agg}' requires a target column. "
+                "Please specify which column to compute."
+            )
 
     if agg == "percentage":
         if not query.numerator_field or not query.denominator_field:
@@ -117,8 +124,21 @@ def validate_query(
 
 
 def _suggest_close(field: str, available: list[str]) -> str | None:
+    """
+    Return the closest available column name to the given field.
+    Uses difflib first (handles typos), then falls back to substring match.
+    """
+    # 1. difflib fuzzy match
+    lower_available = [c.lower() for c in available]
+    close = get_close_matches(field.lower(), lower_available, n=1, cutoff=0.6)
+    if close:
+        idx = lower_available.index(close[0])
+        return available[idx]
+
+    # 2. Substring fallback
     fl = field.lower()
     for col in available:
         if fl in col.lower() or col.lower() in fl:
             return col
+
     return None

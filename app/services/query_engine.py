@@ -14,12 +14,14 @@ Key changes from v1:
   • Multi-tab aggregation (sum/average/min/max) works correctly.
   • scalar_value is always a raw number — formatting happens at response layer.
   • Validation only runs against the resolved tab, not blindly first tab.
+  • Fuzzy value matching on EQ / CONTAINS / IN — handles typos and case.
 
 AI DOES NOT TOUCH THIS FILE.  All logic is explicit, auditable Python.
 """
 from __future__ import annotations
 import time
 import math
+from difflib import get_close_matches
 import pandas as pd
 import numpy as np
 from app.models.models import (
@@ -27,7 +29,6 @@ from app.models.models import (
     AggregationType, OutputFormat
 )
 from app.services.sheets_service import get_sheets_service
-from app.services.text_processor import fuzzy_match_value
 from app.utils.validators import validate_query, ValidationError
 from app.utils.logger import get_logger
 
@@ -40,6 +41,50 @@ _OP_METHOD: dict[str, str] = {
     "lt":  "__lt__",
     "lte": "__le__",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fuzzy matching helper  (defined here — no external dependency needed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fuzzy_match(
+    user_value: str,
+    candidates: list[str],
+    cutoff: float = 0.75,
+) -> str | None:
+    """
+    Find the closest match for user_value among candidates.
+
+    Strategy (in priority order):
+      1. Exact case-insensitive match   → always wins
+      2. Prefix match (candidate starts with user_value, unambiguous)
+      3. difflib.get_close_matches with given cutoff
+
+    Returns the best matching candidate (original case) or None.
+    """
+    if not user_value or not candidates:
+        return None
+
+    lower_val = user_value.lower().strip()
+
+    # 1. Exact (case-insensitive)
+    for c in candidates:
+        if c.lower().strip() == lower_val:
+            return c
+
+    # 2. Unambiguous prefix
+    prefix_hits = [c for c in candidates if c.lower().strip().startswith(lower_val)]
+    if len(prefix_hits) == 1:
+        return prefix_hits[0]
+
+    # 3. Fuzzy via difflib (stdlib — no extra dependency)
+    lower_candidates = [c.lower().strip() for c in candidates]
+    close = get_close_matches(lower_val, lower_candidates, n=1, cutoff=cutoff)
+    if close:
+        idx = lower_candidates.index(close[0])
+        return candidates[idx]
+
+    return None
 
 
 class QueryEngine:
@@ -89,13 +134,9 @@ class QueryEngine:
                 )
             tabs_to_query = {query.sheet_tab: all_dfs[query.sheet_tab]}
         else:
-            # Tab not specified — search all tabs
             tabs_to_query = all_dfs
 
         # 3. Validate against schema
-        # When a specific tab is given, validate strictly against it.
-        # When searching all tabs, skip strict validation — _execute_across_tabs
-        # handles missing columns per-tab gracefully.
         if query.sheet_tab:
             tab_schema     = schema.get(query.sheet_tab, {})
             available_cols = list(tab_schema.keys())
@@ -108,7 +149,7 @@ class QueryEngine:
                     structured_query=query,
                 )
 
-        # 4. Apply filters + aggregation across target tabs
+        # 4. Apply filters + aggregation
         try:
             if len(tabs_to_query) == 1:
                 tab_name, df = next(iter(tabs_to_query.items()))
@@ -139,7 +180,7 @@ class QueryEngine:
         return result
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Multi-tab execution  –  union results across all tabs
+    # Multi-tab execution
     # ──────────────────────────────────────────────────────────────────────────
 
     def _execute_across_tabs(
@@ -147,18 +188,10 @@ class QueryEngine:
         tabs: dict[str, pd.DataFrame],
         query: StructuredQuery,
     ) -> QueryResult:
-        """
-        Run the same query against every tab and union the results.
-        A tab is skipped silently if it doesn't contain the filtered columns.
-        For scalar aggregations (sum/average/min/max), combines into a single
-        DataFrame and delegates to _aggregate.
-        Adds a "_source_tab" column to each result row.
-        """
         combined_frames: list[pd.DataFrame] = []
         total = 0
 
         for tab_name, df in tabs.items():
-            # Skip tabs that don't have all the filtered fields
             missing = [
                 f.field for f in query.filters
                 if f.field not in df.columns
@@ -172,21 +205,15 @@ class QueryEngine:
                 continue
 
             total += len(filtered)
-
             tagged = filtered.copy()
             tagged.insert(0, "_source_tab", tab_name)
             combined_frames.append(tagged)
 
         if not combined_frames:
-            return QueryResult(
-                success=True,
-                rows=[],
-                total_rows_matched=0,
-            )
+            return QueryResult(success=True, rows=[], total_rows_matched=0)
 
         combined_df = pd.concat(combined_frames, ignore_index=True)
 
-        # count — return scalar total
         if query.aggregation in (AggregationType.COUNT.value, "count"):
             return QueryResult(
                 success=True,
@@ -195,26 +222,19 @@ class QueryEngine:
                 total_rows_matched=total,
             )
 
-        # scalar aggregations — delegate to _aggregate on combined DataFrame
         if query.aggregation in (
-            AggregationType.SUM.value,     "sum",
-            AggregationType.AVERAGE.value, "average",
-            AggregationType.MIN.value,     "min",
-            AggregationType.MAX.value,     "max",
+            AggregationType.SUM.value,        "sum",
+            AggregationType.AVERAGE.value,    "average",
+            AggregationType.MIN.value,        "min",
+            AggregationType.MAX.value,        "max",
             AggregationType.PERCENTAGE.value, "percentage",
         ):
             return self._aggregate(combined_df, query, "all tabs")
 
-        # list / table — return rows with source tab column
         display   = query.display_fields or [c for c in combined_df.columns if c != "_source_tab"]
         show_cols = ["_source_tab"] + [c for c in display if c in combined_df.columns]
         rows      = combined_df[show_cols].to_dict(orient="records")
-
-        return QueryResult(
-            success=True,
-            rows=rows,
-            total_rows_matched=total,
-        )
+        return QueryResult(success=True, rows=rows, total_rows_matched=total)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Filtering
@@ -227,22 +247,14 @@ class QueryEngine:
         mask = pd.Series([True] * len(df), index=df.index)
 
         for f in filters:
-            field = f.field
-            op    = f.operator
-            value = f.value
-
-            if field not in df.columns:
-                logger.warning("filter_field_missing_in_tab", field=field)
+            if f.field not in df.columns:
+                logger.warning("filter_field_missing_in_tab", field=f.field)
                 continue
-
-            col = df[field]
-
             try:
-                m = self._apply_single_filter(col, op, value)
+                m = self._apply_single_filter(df[f.field], f.operator, f.value)
             except Exception as exc:
-                logger.warning("filter_apply_failed", field=field, op=op, error=str(exc))
+                logger.warning("filter_apply_failed", field=f.field, op=f.operator, error=str(exc))
                 continue
-
             mask = mask & m.fillna(False)
 
         return df[mask].reset_index(drop=True)
@@ -253,35 +265,25 @@ class QueryEngine:
         op: str,
         value,
     ) -> pd.Series:
-        """
-        Apply one filter condition to a Series.
-        Handles numeric, date, and string columns correctly.
-        """
         is_numeric = pd.api.types.is_numeric_dtype(col)
 
         # ── EQ ───────────────────────────────────────────────────────────────
         if op == FilterOperator.EQ.value:
             if is_numeric:
                 return col == pd.to_numeric(value, errors="coerce")
- 
-            # Case-insensitive exact match first
-            str_val = str(value).strip().lower()
+
+            str_val   = str(value).strip().lower()
             base_mask = col.astype(str).str.strip().str.lower() == str_val
             if base_mask.any():
                 return base_mask
- 
-            # Fuzzy fallback — try to find the closest value in unique values
+
+            # Fuzzy fallback
             unique_vals = col.dropna().astype(str).unique().tolist()
-            best_match  = fuzzy_match_value(str(value), unique_vals, cutoff=0.75)
-            if best_match:
-                logger.info(
-                    "fuzzy_eq_match",
-                    user_value=value,
-                    matched=best_match,
-                    col=col.name,
-                )
-                return col.astype(str).str.strip() == best_match
-            return base_mask  # return empty mask — no match
+            best        = _fuzzy_match(str(value), unique_vals, cutoff=0.75)
+            if best:
+                logger.info("fuzzy_eq_match", user_value=value, matched=best, col=col.name)
+                return col.astype(str).str.strip() == best
+            return base_mask
 
         # ── NEQ ──────────────────────────────────────────────────────────────
         elif op == FilterOperator.NEQ.value:
@@ -289,25 +291,21 @@ class QueryEngine:
                 return col != pd.to_numeric(value, errors="coerce")
             return col.astype(str).str.strip().str.lower() != str(value).strip().lower()
 
-        # ── Range operators: GT / GTE / LT / LTE ─────────────────────────────
+        # ── Range: GT / GTE / LT / LTE ───────────────────────────────────────
         elif op in _OP_METHOD:
             method = _OP_METHOD[op]
 
-            # Try date comparison first
             col_dt = pd.to_datetime(col, format="mixed", dayfirst=True, errors="coerce")
             val_dt = pd.to_datetime(str(value), dayfirst=True, errors="coerce")
-
             if col_dt.notna().mean() > 0.5 and pd.notna(val_dt):
                 return getattr(col_dt, method)(val_dt)
 
-            # Fallback: numeric comparison
             col_num = pd.to_numeric(col, errors="coerce")
             try:
                 val_num = float(value)
             except (TypeError, ValueError):
                 logger.warning("range_filter_non_numeric_value", value=value, op=op)
                 return pd.Series([False] * len(col), index=col.index)
-
             return getattr(col_num, method)(val_num)
 
         # ── CONTAINS ─────────────────────────────────────────────────────────
@@ -316,20 +314,13 @@ class QueryEngine:
             mask    = col.astype(str).str.lower().str.contains(
                 str_val.lower(), regex=False, na=False
             )
-            # If nothing matched, try a fuzzy prefix search (handles typos)
             if not mask.any() and len(str_val) >= 3:
                 unique_vals = col.dropna().astype(str).unique().tolist()
-                best_match  = fuzzy_match_value(str_val, unique_vals, cutoff=0.70)
-                if best_match:
-                    logger.info(
-                        "fuzzy_contains_match",
-                        user_value=str_val,
-                        matched=best_match,
-                        col=col.name,
-                    )
-                    # Use the matched value as a new contains seed
+                best        = _fuzzy_match(str_val, unique_vals, cutoff=0.70)
+                if best:
+                    logger.info("fuzzy_contains_match", user_value=str_val, matched=best, col=col.name)
                     mask = col.astype(str).str.lower().str.contains(
-                        best_match.lower(), regex=False, na=False
+                        best.lower(), regex=False, na=False
                     )
             return mask
 
@@ -341,36 +332,34 @@ class QueryEngine:
 
         # ── IN ───────────────────────────────────────────────────────────────
         elif op == FilterOperator.IN.value:
+            raw_vals        = value if isinstance(value, list) else [value]
+            unique_col_vals = col.dropna().astype(str).unique().tolist()
+
+            resolved: list[str] = []
+            for v in raw_vals:
+                str_v  = str(v).strip()
+                direct = [c for c in unique_col_vals if c.lower() == str_v.lower()]
+                if direct:
+                    resolved.extend(direct)
+                else:
+                    best = _fuzzy_match(str_v, unique_col_vals, cutoff=0.75)
+                    if best:
+                        logger.info("fuzzy_in_match", user_value=str_v, matched=best, col=col.name)
+                        resolved.append(best)
+                    else:
+                        resolved.append(str_v)
+
+            resolved_lower = [r.lower() for r in resolved]
+            return col.astype(str).str.lower().isin(resolved_lower)
+
+        # ── NOT_IN ───────────────────────────────────────────────────────────
+        elif op == FilterOperator.NOT_IN.value:                # ← was IN.value (bug)
             vals = (
                 [str(v).lower() for v in value]
                 if isinstance(value, list)
                 else [str(value).lower()]
             )
-            return col.astype(str).str.lower().isin(vals)
-
-        # ── NOT_IN ───────────────────────────────────────────────────────────
-        elif op == FilterOperator.IN.value:
-            raw_vals = value if isinstance(value, list) else [value]
-            unique_col_vals = col.dropna().astype(str).unique().tolist()
- 
-            resolved: list[str] = []
-            for v in raw_vals:
-                str_v = str(v).strip()
-                # Direct case-insensitive check
-                direct = [c for c in unique_col_vals if c.lower() == str_v.lower()]
-                if direct:
-                    resolved.extend(direct)
-                else:
-                    # Fuzzy resolve
-                    best = fuzzy_match_value(str_v, unique_col_vals, cutoff=0.75)
-                    if best:
-                        logger.info("fuzzy_in_match", user_value=str_v, matched=best, col=col.name)
-                        resolved.append(best)
-                    else:
-                        resolved.append(str_v)  # keep original — let it produce empty match
- 
-            resolved_lower = [r.lower() for r in resolved]
-            return col.astype(str).str.lower().isin(resolved_lower)
+            return ~col.astype(str).str.lower().isin(vals)
 
         else:
             logger.warning("unknown_operator", op=op)
@@ -389,7 +378,6 @@ class QueryEngine:
         agg = query.aggregation
         n   = len(df)
 
-        # ── COUNT ─────────────────────────────────────────────────────────────
         if agg in (AggregationType.COUNT.value, "count"):
             return QueryResult(
                 success=True,
@@ -398,51 +386,87 @@ class QueryEngine:
                 total_rows_matched=n,
             )
 
-        # ── SUM ───────────────────────────────────────────────────────────────
         elif agg in (AggregationType.SUM.value, "sum"):
             field = query.target_field
-            total = self._safe_numeric(df, field, "sum")
+
+            # ── Single-field sum (normal path) ────────────────────────────────
+            if field:
+                return QueryResult(
+                    success=True,
+                    scalar_value=self._safe_numeric(df, field, "sum"),
+                    scalar_label=f"Sum of '{field}' in '{tab_name}'",
+                    total_rows_matched=n,
+                )
+
+            # ── Multi-field sum — target_field is None but display_fields has
+            #    multiple numeric columns  (e.g. "total cost AND received for X")
+            candidate_fields = query.display_fields or list(df.columns)
+            sums: dict[str, float] = {}
+            for f in candidate_fields:
+                if f not in df.columns:
+                    continue
+                if pd.api.types.is_numeric_dtype(df[f]) or pd.to_numeric(
+                    df[f], errors="coerce"
+                ).notna().mean() > 0.5:
+                    val = self._safe_numeric(df, f, "sum")
+                    sums[f] = val
+
+            if not sums:
+                return QueryResult(
+                    success=False,
+                    error_message=(
+                        "Aggregation 'sum' requires a numeric target column. "
+                        f"None of the display fields {candidate_fields} are numeric."
+                    ),
+                    structured_query=query,
+                    total_rows_matched=n,
+                )
+
+            if len(sums) == 1:
+                only_field, only_val = next(iter(sums.items()))
+                return QueryResult(
+                    success=True,
+                    scalar_value=only_val,
+                    scalar_label=f"Sum of '{only_field}' in '{tab_name}'",
+                    total_rows_matched=n,
+                )
+
+            # Multiple fields → return as a single summary row so the formatter
+            # can display each column with its label and INR formatting intact
             return QueryResult(
                 success=True,
-                scalar_value=total,
-                scalar_label=f"Sum of '{field}' in '{tab_name}'",
+                rows=[sums],
+                scalar_label=f"Totals in '{tab_name}'",
                 total_rows_matched=n,
             )
 
-        # ── AVERAGE ───────────────────────────────────────────────────────────
         elif agg in (AggregationType.AVERAGE.value, "average"):
             field = query.target_field
-            avg   = self._safe_numeric(df, field, "mean")
             return QueryResult(
                 success=True,
-                scalar_value=avg,
+                scalar_value=self._safe_numeric(df, field, "mean"),
                 scalar_label=f"Average of '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
-        # ── MIN ───────────────────────────────────────────────────────────────
         elif agg in (AggregationType.MIN.value, "min"):
             field = query.target_field
-            val   = self._safe_numeric(df, field, "min")
             return QueryResult(
                 success=True,
-                scalar_value=val,
+                scalar_value=self._safe_numeric(df, field, "min"),
                 scalar_label=f"Minimum '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
-        # ── MAX ───────────────────────────────────────────────────────────────
         elif agg in (AggregationType.MAX.value, "max"):
             field = query.target_field
-            val   = self._safe_numeric(df, field, "max")
             return QueryResult(
                 success=True,
-                scalar_value=val,
+                scalar_value=self._safe_numeric(df, field, "max"),
                 scalar_label=f"Maximum '{field}' in '{tab_name}'",
                 total_rows_matched=n,
             )
 
-        # ── PERCENTAGE ────────────────────────────────────────────────────────
         elif agg in (AggregationType.PERCENTAGE.value, "percentage"):
             num_total = self._safe_numeric(df, query.numerator_field,   "sum")
             den_total = self._safe_numeric(df, query.denominator_field, "sum")
@@ -457,8 +481,8 @@ class QueryEngine:
                 total_rows_matched=n,
             )
 
-        # ── LIST / TABLE (default) ────────────────────────────────────────────
         else:
+            # LIST / TABLE
             display = query.display_fields or list(df.columns)
             display = [c for c in display if c in df.columns]
             rows    = (
@@ -466,11 +490,7 @@ class QueryEngine:
                 if display
                 else df.to_dict(orient="records")
             )
-            return QueryResult(
-                success=True,
-                rows=rows,
-                total_rows_matched=n,
-            )
+            return QueryResult(success=True, rows=rows, total_rows_matched=n)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -480,13 +500,8 @@ class QueryEngine:
     def _safe_numeric(
         df: pd.DataFrame,
         field: str | None,
-        operation: str,  # "sum" | "mean" | "min" | "max"
+        operation: str,
     ) -> float:
-        """
-        Safely apply a numeric aggregation to a column.
-        Returns 0.0 if field is missing or non-numeric.
-        scalar_value is always a raw float — format at the response layer.
-        """
         if not field or field not in df.columns:
             return 0.0
         series = pd.to_numeric(df[field], errors="coerce")
@@ -497,10 +512,6 @@ class QueryEngine:
 
     @staticmethod
     def format_scalar(value: float | int | None) -> str:
-        """
-        Human-readable formatting for scalar values.
-        Call this at the response/display layer, NOT inside _aggregate.
-        """
         if value is None or (isinstance(value, float) and math.isnan(value)):
             return "N/A"
         if isinstance(value, float) and value == int(value):
