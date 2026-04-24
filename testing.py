@@ -13,10 +13,11 @@ async def test_llm_service():
     msg = IncomingMessage(
             platform="telegram",
             user_id="testuser",
-            text = "Total cost and total recieved in diksha group"
+            text = "Find a person named Gaurav khana"
             # text="I want to know about customers who are having annual income of greater that 100000 and spending score greater than 75 percent and online purchase greater than 100",
         )
-    orchestrator = get_orchestrator()    response_text = await orchestrator.handle(msg)
+    orchestrator = get_orchestrator()    
+    response_text = await orchestrator.handle(msg)
     print(response_text)
 
 asyncio.run(test_llm_service())
